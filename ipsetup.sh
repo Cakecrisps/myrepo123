@@ -520,7 +520,9 @@ issue_certificate() {
   echo
   ok "IP certificate issued and installed"
   echo "  cert: $DEFAULT_CERT_FILE"
-  echo "  key:  $DEFAULT_KEY_KEY -> $DEFAULT_KEY_PEM"
+  rm /opt/remnanode/xray-ssl/privkey,key
+  cp /opt/remnanode/xray-ssl/privkey.pem /opt/remnanode/xray-ssl/privkey.key 
+  echo "  key:  $DEFAULT_KEY_KEY -> COPIED $DEFAULT_KEY_PEM"
   echo
   echo "Panel / Xray inbound TLS settings should point to:"
   echo "  certificates[0].certificateFile: \"/var/lib/remnawave/configs/xray/ssl/fullchain.pem\""
