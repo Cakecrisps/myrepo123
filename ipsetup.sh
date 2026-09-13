@@ -36,6 +36,7 @@ RENEW_RANDOMIZED_DELAY_SECONDS="${RENEW_RANDOMIZED_DELAY_SECONDS:-1800}"
 
 DEPLOY_HOOK="/usr/local/sbin/remnanode-ip-cert-deploy.sh"
 LOG_FILE="/var/log/remnanode-ip-cert.log"
+STATUS_FILE="/var/log/remnanode-ip-cert.status"
 LOCK_FILE="/run/remnanode-ip-cert.lock"
 
 SERVICE_FILE="/etc/systemd/system/remnanode-ip-cert-renew.service"
@@ -45,10 +46,60 @@ DEFAULT_CERT_FILE="$CERT_DIR/fullchain.pem"
 DEFAULT_KEY_PEM="$CERT_DIR/privkey.pem"
 DEFAULT_KEY_KEY="$CERT_DIR/privkey.key"
 
+# ---------------------------------------------------------------------------
+# Progress / status tracking
+#
+# Every stage of `issue` updates both the on-screen checklist and
+# $STATUS_FILE, so the task can be followed from a *second* SSH session
+# with:   watch -n2 cat /var/log/remnanode-ip-cert.status
+# or:     tail -f /var/log/remnanode-ip-cert.log
+# ---------------------------------------------------------------------------
+STEP_TOTAL=6
+STEP_CURRENT=0
+
+STATUS_CERTBOT="PENDING";  NOTE_CERTBOT=""
+STATUS_IP="PENDING";       NOTE_IP=""
+STATUS_PORT80="PENDING";   NOTE_PORT80=""
+STATUS_ISSUE="PENDING";    NOTE_ISSUE=""
+STATUS_DEPLOY="PENDING";   NOTE_DEPLOY=""
+STATUS_TIMER="PENDING";    NOTE_TIMER=""
+
 die() { echo "FAIL: $*" >&2; exit 1; }
 ok()   { echo "OK: $*"; }
 info() { echo "-- $*"; }
 warn() { echo "WARN: $*" >&2; }
+
+step() {
+  STEP_CURRENT=$((STEP_CURRENT + 1))
+  echo
+  echo "[${STEP_CURRENT}/${STEP_TOTAL}] $*"
+}
+
+# set_status <VAR_SUFFIX> <PENDING|IN_PROGRESS|OK|FAIL> [note]
+set_status() {
+  local suffix="$1" value="$2" note="${3:-}"
+  printf -v "STATUS_${suffix}" '%s' "$value"
+  printf -v "NOTE_${suffix}" '%s' "$note"
+  {
+    echo "$(date -u +%FT%TZ) ${suffix}=${value}${note:+ (${note})}"
+  } >> "$STATUS_FILE" 2>/dev/null || true
+}
+
+print_summary() {
+  local rc=$?
+  echo
+  echo "================ RemnaNode IP-cert: checklist ================"
+  printf '  %-18s %s\n' "certbot:"        "${STATUS_CERTBOT}${NOTE_CERTBOT:+ (${NOTE_CERTBOT})}"
+  printf '  %-18s %s\n' "public IP:"      "${STATUS_IP}${NOTE_IP:+ (${NOTE_IP})}"
+  printf '  %-18s %s\n' "port 80 check:"  "${STATUS_PORT80}${NOTE_PORT80:+ (${NOTE_PORT80})}"
+  printf '  %-18s %s\n' "issue cert:"     "${STATUS_ISSUE}${NOTE_ISSUE:+ (${NOTE_ISSUE})}"
+  printf '  %-18s %s\n' "deploy cert:"    "${STATUS_DEPLOY}${NOTE_DEPLOY:+ (${NOTE_DEPLOY})}"
+  printf '  %-18s %s\n' "renew timer:"    "${STATUS_TIMER}${NOTE_TIMER:+ (${NOTE_TIMER})}"
+  echo "================================================================"
+  echo "Full log:    ${LOG_FILE}"
+  echo "Status file: ${STATUS_FILE}  (tail -f it from another session to follow progress)"
+  return "$rc"
+}
 
 require_root() {
   [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "run as root (sudo -i)"
@@ -141,6 +192,7 @@ install_certbot_via_pip() {
 }
 
 ensure_certbot() {
+  set_status CERTBOT IN_PROGRESS
   local bin
   bin="$(certbot_bin || true)"
 
@@ -148,15 +200,24 @@ ensure_certbot() {
     info "certbot not found, installing via snap (auto-updating channel)"
     if ! install_certbot_via_snap; then
       warn "snap install failed, falling back to pip venv"
-      install_certbot_via_pip || die "failed to install certbot via snap and pip"
+      if ! install_certbot_via_pip; then
+        set_status CERTBOT FAIL "install via snap and pip both failed"
+        die "failed to install certbot via snap and pip"
+      fi
     fi
     bin="$(certbot_bin || true)"
   fi
-  [[ -n "$bin" ]] || die "certbot binary not found after install"
+  if [[ -z "$bin" ]]; then
+    set_status CERTBOT FAIL "binary not found after install"
+    die "certbot binary not found after install"
+  fi
 
   local ver
   ver="$("$bin" --version 2>/dev/null | awk '{print $2}')"
-  [[ -n "$ver" ]] || die "unable to determine certbot version from '$bin --version'"
+  if [[ -z "$ver" ]]; then
+    set_status CERTBOT FAIL "could not parse '$bin --version'"
+    die "unable to determine certbot version from '$bin --version'"
+  fi
 
   if ! version_ge "$ver" "$CERTBOT_MIN_VERSION"; then
     warn "certbot $ver is older than required $CERTBOT_MIN_VERSION, attempting upgrade"
@@ -166,9 +227,13 @@ ensure_certbot() {
       /opt/certbot-venv/bin/pip install --upgrade "certbot>=${CERTBOT_MIN_VERSION},<6" || true
     fi
     ver="$("$bin" --version 2>/dev/null | awk '{print $2}')"
-    version_ge "$ver" "$CERTBOT_MIN_VERSION" || die "certbot $ver still below required $CERTBOT_MIN_VERSION (IP-address certs need >=5.3, webroot-for-IP needs >=5.4)"
+    if ! version_ge "$ver" "$CERTBOT_MIN_VERSION"; then
+      set_status CERTBOT FAIL "stuck at $ver, need >=$CERTBOT_MIN_VERSION"
+      die "certbot $ver still below required $CERTBOT_MIN_VERSION (IP-address certs need >=5.3, webroot-for-IP needs >=5.4)"
+    fi
   fi
 
+  set_status CERTBOT OK "v$ver at $bin"
   ok "certbot $ver is available at $bin (>= required $CERTBOT_MIN_VERSION)"
   printf '%s' "$bin"
 }
@@ -182,8 +247,10 @@ ensure_port80_free() {
   listeners="$(ss -H -ltnp "( sport = :${HTTP01_PORT} )" 2>/dev/null || true)"
   if [[ -n "$listeners" ]]; then
     echo "$listeners"
+    set_status PORT80 FAIL "port ${HTTP01_PORT} already in use"
     die "port ${HTTP01_PORT} is already in use; free it (or set HTTP01_PORT to another port that is reachable from the internet on 80) before issuing/renewing"
   fi
+  set_status PORT80 OK "port ${HTTP01_PORT} is free"
 }
 
 # ---------------------------------------------------------------------------
@@ -267,21 +334,40 @@ issue_certificate() {
   require_root
   need_cmd curl
   mkdir -p "$CERT_DIR" "$(dirname "$LOG_FILE")"
-  touch "$LOG_FILE"
+  touch "$LOG_FILE" "$STATUS_FILE"
+  trap print_summary EXIT
 
+  # Mirror everything to the log file so the run can be followed with
+  # `tail -f /var/log/remnanode-ip-cert.log` from a second SSH session.
+  exec > >(tee -a "$LOG_FILE") 2>&1
+
+  echo "Starting at $(date -u +%FT%TZ). Follow progress from another session with:"
+  echo "  tail -f ${LOG_FILE}"
+  echo "  watch -n2 cat ${STATUS_FILE}"
+
+  step "Installing / verifying certbot (needs >= ${CERTBOT_MIN_VERSION} for IP certs)"
   local certbot
   certbot="$(ensure_certbot)"
 
+  step "Detecting public IPv4 address"
+  set_status IP IN_PROGRESS
   if [[ -z "$NODE_IP" ]]; then
     info "NODE_IP not set, auto-detecting public IPv4"
     NODE_IP="$(detect_public_ip || true)"
   fi
-  is_ipv4 "$NODE_IP" || die "could not determine a valid public IPv4 address (set NODE_IP=1.2.3.4 explicitly)"
+  if ! is_ipv4 "$NODE_IP"; then
+    set_status IP FAIL "could not auto-detect a valid IPv4"
+    die "could not determine a valid public IPv4 address (set NODE_IP=1.2.3.4 explicitly)"
+  fi
+  set_status IP OK "$NODE_IP"
   ok "using IP address: $NODE_IP"
 
+  step "Checking that port ${HTTP01_PORT} is free for the HTTP-01 challenge"
   ensure_port80_free
   write_deploy_hook_script
 
+  step "Requesting the IP certificate from Let's Encrypt (profile: shortlived, ~160h validity)"
+  set_status ISSUE IN_PROGRESS
   local -a args=(
     certonly --standalone --non-interactive --agree-tos
     --preferred-profile shortlived
@@ -301,14 +387,26 @@ issue_certificate() {
     args+=(--staging)
   fi
 
-  info "requesting IP certificate for ${NODE_IP} (profile: shortlived, ~160h validity)"
-  "$certbot" "${args[@]}" || die "certbot certonly failed, see /var/log/letsencrypt/letsencrypt.log"
+  if ! "$certbot" "${args[@]}"; then
+    set_status ISSUE FAIL "certonly failed, see /var/log/letsencrypt/letsencrypt.log"
+    die "certbot certonly failed, see /var/log/letsencrypt/letsencrypt.log"
+  fi
+  set_status ISSUE OK "certificate obtained for $NODE_IP"
 
+  step "Deploying the certificate into ${CERT_DIR} and restarting containers"
+  set_status DEPLOY IN_PROGRESS
   # --deploy-hook only fires on *renewal*, so run it once manually now to
   # populate $CERT_DIR with the certificate we just issued.
-  "$DEPLOY_HOOK" "/etc/letsencrypt/live/${NODE_IP}" || die "initial deploy step failed"
+  if ! "$DEPLOY_HOOK" "/etc/letsencrypt/live/${NODE_IP}"; then
+    set_status DEPLOY FAIL "deploy hook returned non-zero"
+    die "initial deploy step failed"
+  fi
+  set_status DEPLOY OK "installed into ${CERT_DIR}"
 
+  step "Installing the systemd renewal timer"
+  set_status TIMER IN_PROGRESS
   install_renew_timer
+  set_status TIMER OK "${RENEW_ON_CALENDAR} (+${RENEW_RANDOMIZED_DELAY_SECONDS}s)"
 
   echo
   ok "IP certificate issued and installed"
@@ -379,6 +477,11 @@ EOF2
 # ---------------------------------------------------------------------------
 renew_certificate() {
   require_root
+  mkdir -p "$(dirname "$LOG_FILE")"
+  touch "$LOG_FILE" "$STATUS_FILE"
+  exec > >(tee -a "$LOG_FILE") 2>&1
+
+  echo "[$(date -u +%FT%TZ)] renew check starting for ${NODE_IP:-<unset>}"
   local certbot
   certbot="$(certbot_bin)"
   [[ -n "$certbot" ]] || die "certbot not installed; run 'issue' first"
@@ -391,8 +494,13 @@ renew_certificate() {
     args+=(--staging)
   fi
 
-  "$certbot" "${args[@]}"
-  ok "renew check completed for ${NODE_IP} (deploy-hook runs automatically if it actually renewed)"
+  if "$certbot" "${args[@]}"; then
+    set_status RENEW_LAST OK "$(date -u +%FT%TZ)"
+    ok "renew check completed for ${NODE_IP} (deploy-hook runs automatically if it actually renewed)"
+  else
+    set_status RENEW_LAST FAIL "$(date -u +%FT%TZ)"
+    die "certbot renew failed for ${NODE_IP}, see ${LOG_FILE}"
+  fi
 }
 
 status() {
@@ -400,6 +508,9 @@ status() {
   certbot="$(certbot_bin || true)"
   [[ -n "$certbot" ]] || die "certbot not installed"
   "$certbot" certificates || true
+  echo
+  echo "-- last recorded status events (${STATUS_FILE}) --"
+  tail -n 20 "$STATUS_FILE" 2>/dev/null || echo "(no status file yet — run 'issue' first)"
   echo
   systemctl status remnanode-ip-cert-renew.timer --no-pager 2>/dev/null || warn "timer not installed yet"
   systemctl list-timers 'remnanode-ip-cert-renew.timer' --no-pager 2>/dev/null || true
@@ -424,6 +535,10 @@ Usage: $0 <command>
 
 Useful env vars: NODE_IP, LE_EMAIL, CERTBOT_STAGING=1, RESTART_ON_RENEW=0,
                  REMNANODE_DIR, REMNANODE_SERVICE_NAME, SELFSTEAL_NGINX_SERVICE_NAME.
+
+Track progress of a running 'issue'/'renew' from another SSH session with:
+  tail -f ${LOG_FILE}
+  watch -n2 cat ${STATUS_FILE}
 USAGE
       exit 1
       ;;
