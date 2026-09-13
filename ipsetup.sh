@@ -31,6 +31,13 @@ CERTBOT_MIN_VERSION="${CERTBOT_MIN_VERSION:-5.4.0}"
 HTTP01_PORT="${HTTP01_PORT:-80}"
 RESTART_ON_RENEW="${RESTART_ON_RENEW:-1}"        # 1 = docker restart remnanode(+nginx-selfsteal) after real renewal
 
+# RemnaNode container management (only used if $COMPOSE_FILE doesn't exist yet
+# or the container isn't running — mirrors moonsetup.sh's write_remnanode_files/start_remnanode)
+MANAGE_REMNANODE="${MANAGE_REMNANODE:-1}"        # 0 = never touch/create the remnanode container
+REMNANODE_IMAGE="${REMNANODE_IMAGE:-remnawave/node:3.1.0}"
+DEFAULT_NODE_PORT="${DEFAULT_NODE_PORT:-2222}"
+REMNANODE_SECRET_KEY="${REMNANODE_SECRET_KEY:-}"
+
 RENEW_ON_CALENDAR="${RENEW_ON_CALENDAR:-*-*-* 0/6:00:00}"   # every 6h
 RENEW_RANDOMIZED_DELAY_SECONDS="${RENEW_RANDOMIZED_DELAY_SECONDS:-1800}"
 
@@ -54,7 +61,7 @@ DEFAULT_KEY_KEY="$CERT_DIR/privkey.key"
 # with:   watch -n2 cat /var/log/remnanode-ip-cert.status
 # or:     tail -f /var/log/remnanode-ip-cert.log
 # ---------------------------------------------------------------------------
-STEP_TOTAL=6
+STEP_TOTAL=7
 STEP_CURRENT=0
 
 STATUS_CERTBOT="PENDING";  NOTE_CERTBOT=""
@@ -62,6 +69,7 @@ STATUS_IP="PENDING";       NOTE_IP=""
 STATUS_PORT80="PENDING";   NOTE_PORT80=""
 STATUS_ISSUE="PENDING";    NOTE_ISSUE=""
 STATUS_DEPLOY="PENDING";   NOTE_DEPLOY=""
+STATUS_REMNANODE="PENDING"; NOTE_REMNANODE=""
 STATUS_TIMER="PENDING";    NOTE_TIMER=""
 
 die() { echo "FAIL: $*" >&2; exit 1; }
@@ -99,6 +107,7 @@ print_summary() {
   printf '  %-18s %s\n' "port 80 check:"  "${STATUS_PORT80}${NOTE_PORT80:+ (${NOTE_PORT80})}"
   printf '  %-18s %s\n' "issue cert:"     "${STATUS_ISSUE}${NOTE_ISSUE:+ (${NOTE_ISSUE})}"
   printf '  %-18s %s\n' "deploy cert:"    "${STATUS_DEPLOY}${NOTE_DEPLOY:+ (${NOTE_DEPLOY})}"
+  printf '  %-18s %s\n' "remnanode up:"   "${STATUS_REMNANODE}${NOTE_REMNANODE:+ (${NOTE_REMNANODE})}"
   printf '  %-18s %s\n' "renew timer:"    "${STATUS_TIMER}${NOTE_TIMER:+ (${NOTE_TIMER})}"
   echo "================================================================"
   echo "Full log:    ${LOG_FILE}"
@@ -333,6 +342,98 @@ EOF2
 }
 
 # ---------------------------------------------------------------------------
+# RemnaNode container: install docker if needed, write a minimal compose file
+# only if one doesn't already exist, and make sure the container is up.
+# (Mirrors write_remnanode_files/start_remnanode from moonsetup.sh — if you
+# already ran moonsetup.sh, $COMPOSE_FILE exists and this just does
+# `docker compose up -d` / leaves your file untouched.)
+# ---------------------------------------------------------------------------
+ensure_docker() {
+  if ! command -v docker >/dev/null 2>&1; then
+    info "docker not found, installing via get.docker.com"
+    curl -fsSL https://get.docker.com | sh
+  fi
+  command -v docker >/dev/null 2>&1 || die "docker installation failed"
+
+  if ! docker compose version >/dev/null 2>&1; then
+    info "docker compose v2 not found, installing plugin"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y || true
+    apt-get install -y docker-compose-plugin || apt-get install -y docker-compose-v2 || true
+  fi
+  docker compose version >/dev/null 2>&1 || die "docker compose v2 is required but could not be installed"
+}
+
+write_remnanode_compose() {
+  local secret_key="$1"
+  local escaped_secret="${secret_key//\\/\\\\}"
+  escaped_secret="${escaped_secret//\"/\\\"}"
+
+  mkdir -p "$REMNANODE_DIR" "$CERT_DIR"
+  chmod 700 "$CERT_DIR" || true
+
+  cat > "$COMPOSE_FILE" <<EOF2
+services:
+  ${REMNANODE_SERVICE_NAME}:
+    container_name: ${REMNANODE_SERVICE_NAME}
+    hostname: ${REMNANODE_SERVICE_NAME}
+    image: ${REMNANODE_IMAGE}
+    restart: always
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+    environment:
+      NODE_PORT: "${DEFAULT_NODE_PORT}"
+      SECRET_KEY: "${escaped_secret}"
+    volumes:
+      - ./xray-ssl:/var/lib/remnawave/configs/xray/ssl
+EOF2
+
+  ok "written: $COMPOSE_FILE"
+}
+
+ensure_remnanode_running() {
+  if [[ "$MANAGE_REMNANODE" != "1" ]]; then
+    set_status REMNANODE OK "MANAGE_REMNANODE=0, skipped"
+    return 0
+  fi
+
+  set_status REMNANODE IN_PROGRESS
+  ensure_docker
+
+  if [[ ! -f "$COMPOSE_FILE" ]]; then
+    info "no compose file at $COMPOSE_FILE yet, creating one"
+    local secret_key="$REMNANODE_SECRET_KEY"
+    if [[ -z "$secret_key" ]]; then
+      # stdout is redirected to tee at this point in issue_certificate, but
+      # /dev/tty is still the real terminal, so an interactive prompt works.
+      if [[ -r /dev/tty ]]; then
+        read -r -p "Paste SECRET_KEY from the Remnawave panel: " secret_key < /dev/tty || true
+      fi
+    fi
+    secret_key="$(trim "${secret_key//$'\r'/}")"
+    if [[ -z "$secret_key" ]]; then
+      set_status REMNANODE FAIL "SECRET_KEY not provided"
+      die "SECRET_KEY is required to create $COMPOSE_FILE (set REMNANODE_SECRET_KEY=... or run interactively)"
+    fi
+    write_remnanode_compose "$secret_key"
+  else
+    info "compose file already exists at $COMPOSE_FILE, leaving it as-is"
+  fi
+
+  ( cd "$REMNANODE_DIR" && docker compose up -d "$REMNANODE_SERVICE_NAME" )
+
+  sleep 2
+  if docker ps --format '{{.Names}}' | grep -qx "$REMNANODE_SERVICE_NAME"; then
+    set_status REMNANODE OK "container is running"
+    ok "$REMNANODE_SERVICE_NAME is up"
+  else
+    set_status REMNANODE FAIL "container did not start, check: docker compose -f $COMPOSE_FILE logs"
+    die "$REMNANODE_SERVICE_NAME did not start; check 'docker compose -f $COMPOSE_FILE logs'"
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # Issue the certificate for the first time
 # ---------------------------------------------------------------------------
 issue_certificate() {
@@ -407,6 +508,9 @@ issue_certificate() {
     die "initial deploy step failed"
   fi
   set_status DEPLOY OK "installed into ${CERT_DIR}"
+
+  step "Making sure the RemnaNode container is up"
+  ensure_remnanode_running
 
   step "Installing the systemd renewal timer"
   set_status TIMER IN_PROGRESS
@@ -539,7 +643,9 @@ Usage: $0 <command>
   status          Show certbot certificate info + timer status.
 
 Useful env vars: NODE_IP, LE_EMAIL, CERTBOT_STAGING=1, RESTART_ON_RENEW=0,
-                 REMNANODE_DIR, REMNANODE_SERVICE_NAME, SELFSTEAL_NGINX_SERVICE_NAME.
+                 REMNANODE_DIR, REMNANODE_SERVICE_NAME, SELFSTEAL_NGINX_SERVICE_NAME,
+                 MANAGE_REMNANODE=0 (skip creating/starting the container),
+                 REMNANODE_SECRET_KEY=... (avoid the interactive prompt).
 
 Track progress of a running 'issue'/'renew' from another SSH session with:
   tail -f ${LOG_FILE}
