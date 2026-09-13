@@ -48,6 +48,18 @@ RENEW_RANDOMIZED_DELAY_SECONDS="${RENEW_RANDOMIZED_DELAY_SECONDS:-1800}"
 # "device not yet seeded" and only succeeds on a second invocation.
 SNAP_SEED_WAIT_SECONDS="${SNAP_SEED_WAIT_SECONDS:-60}"
 
+# Set by ensure_certbot() (as a plain variable assignment, NOT via command
+# substitution) so that:
+#  (a) set_status CERTBOT ... calls inside ensure_certbot actually affect the
+#      real shell and are reflected in the final checklist, and
+#  (b) nothing an installer (snap/pip/apt) prints to stdout can ever leak
+#      into the resolved certbot path (which happened before: `snap install
+#      --classic certbot` prints normal status lines to stdout, and when
+#      ensure_certbot was called as `certbot="$(ensure_certbot)"`, those
+#      lines got appended into $certbot, producing a garbage multi-line
+#      "path" that then failed with "File name too long" when executed).
+CERTBOT_BIN=""
+
 DEPLOY_HOOK="/usr/local/sbin/remnanode-ip-cert-deploy.sh"
 LOG_FILE="/var/log/remnanode-ip-cert.log"
 STATUS_FILE="/var/log/remnanode-ip-cert.status"
@@ -80,11 +92,13 @@ STATUS_REMNANODE="PENDING"; NOTE_REMNANODE=""
 STATUS_TIMER="PENDING";    NOTE_TIMER=""
 
 die() { echo "FAIL: $*" >&2; exit 1; }
-# ok()/info() MUST go to stderr, never stdout: several functions (ensure_certbot,
-# certbot_bin, detect_public_ip) are called as `x="$(fn)"` and rely on stdout
-# containing *only* their actual return value. Mixing status text into stdout
-# there silently corrupts the captured value (e.g. certbot path becomes a
-# multi-line string bash then fails to execute).
+# ok()/info() MUST go to stderr, never stdout: certbot_bin() and
+# detect_public_ip() are called as `x="$(fn)"` and rely on stdout containing
+# *only* their actual return value. Mixing status text into stdout there
+# silently corrupts the captured value (e.g. certbot path becomes a
+# multi-line string bash then fails to execute — this is exactly what used
+# to happen with ensure_certbot() before it was switched to setting the
+# CERTBOT_BIN global instead of being called via command substitution).
 ok()   { echo "OK: $*" >&2; }
 info() { echo "-- $*" >&2; }
 warn() { echo "WARN: $*" >&2; }
@@ -217,10 +231,15 @@ wait_for_snap_seed() {
 }
 
 install_certbot_via_snap() {
+  # NOTE: every external command below is redirected so it cannot write to
+  # *this function's* stdout. This function only ever runs as part of
+  # ensure_certbot(), and stdout chatter here has previously corrupted the
+  # resolved certbot path (see CERTBOT_BIN comment above) — keep it that way
+  # even if this function is refactored later.
   command -v snap >/dev/null 2>&1 || {
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -y || true
-    apt-get install -y snapd || return 1
+    apt-get update -y >&2 || true
+    apt-get install -y snapd >&2 || return 1
     systemctl enable --now snapd.socket >/dev/null 2>&1 || true
   }
 
@@ -231,7 +250,7 @@ install_certbot_via_snap() {
   if command -v apt-get >/dev/null 2>&1; then
     apt-get remove -y certbot >/dev/null 2>&1 || true
   fi
-  snap install --classic certbot || return 1
+  snap install --classic certbot >&2 || return 1
   ln -sf /snap/bin/certbot /usr/bin/certbot
   # Give the freshly mounted snap a moment before we start calling it.
   sleep 2
@@ -240,16 +259,16 @@ install_certbot_via_snap() {
 
 install_certbot_via_pip() {
   need_cmd python3
-  if ! python3 -m venv /opt/certbot-venv 2>/dev/null; then
+  if ! python3 -m venv /opt/certbot-venv >&2; then
     # python3-venv is often missing on minimal images; try to install it
     # before giving up.
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -y || true
+    apt-get update -y >&2 || true
     apt-get install -y python3-venv >/dev/null 2>&1 || true
-    python3 -m venv /opt/certbot-venv || return 1
+    python3 -m venv /opt/certbot-venv >&2 || return 1
   fi
-  /opt/certbot-venv/bin/pip install --upgrade pip >/dev/null
-  /opt/certbot-venv/bin/pip install "certbot>=${CERTBOT_MIN_VERSION},<6" || return 1
+  /opt/certbot-venv/bin/pip install --upgrade pip >&2
+  /opt/certbot-venv/bin/pip install "certbot>=${CERTBOT_MIN_VERSION},<6" >&2 || return 1
   ln -sf /opt/certbot-venv/bin/certbot /usr/local/bin/certbot
   return 0
 }
@@ -285,9 +304,9 @@ ensure_certbot() {
   if ! version_ge "$ver" "$CERTBOT_MIN_VERSION"; then
     warn "certbot $ver is older than required $CERTBOT_MIN_VERSION, attempting upgrade"
     if [[ "$bin" == "/snap/bin/certbot" ]]; then
-      snap refresh certbot || true
+      snap refresh certbot >&2 || true
     elif [[ "$bin" == "/opt/certbot-venv/bin/certbot" ]]; then
-      /opt/certbot-venv/bin/pip install --upgrade "certbot>=${CERTBOT_MIN_VERSION},<6" || true
+      /opt/certbot-venv/bin/pip install --upgrade "certbot>=${CERTBOT_MIN_VERSION},<6" >&2 || true
     fi
     ver="$("$bin" --version 2>/dev/null | awk '{print $2}')"
     if ! version_ge "$ver" "$CERTBOT_MIN_VERSION"; then
@@ -298,7 +317,11 @@ ensure_certbot() {
 
   set_status CERTBOT OK "v$ver at $bin"
   ok "certbot $ver is available at $bin (>= required $CERTBOT_MIN_VERSION)"
-  printf '%s' "$bin"
+  # IMPORTANT: assign to the global instead of `printf`-ing to stdout. This
+  # function must be called as a plain statement (`ensure_certbot`), never
+  # as `x="$(ensure_certbot)"` — see the CERTBOT_BIN comment near the top
+  # of this file for why that command-substitution pattern is unsafe here.
+  CERTBOT_BIN="$bin"
 }
 
 # ---------------------------------------------------------------------------
@@ -515,8 +538,9 @@ issue_certificate() {
   echo "  watch -n2 cat ${STATUS_FILE}"
 
   step "Installing / verifying certbot (needs >= ${CERTBOT_MIN_VERSION} for IP certs)"
-  local certbot
-  certbot="$(ensure_certbot)"
+  ensure_certbot
+  local certbot="$CERTBOT_BIN"
+  [[ -n "$certbot" ]] || die "internal error: ensure_certbot did not set CERTBOT_BIN"
 
   step "Detecting public IPv4 address"
   set_status IP IN_PROGRESS
