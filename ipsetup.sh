@@ -41,6 +41,13 @@ REMNANODE_SECRET_KEY="${REMNANODE_SECRET_KEY:-}"
 RENEW_ON_CALENDAR="${RENEW_ON_CALENDAR:-*-*-* 0/6:00:00}"   # every 6h
 RENEW_RANDOMIZED_DELAY_SECONDS="${RENEW_RANDOMIZED_DELAY_SECONDS:-1800}"
 
+# How long to wait for snapd to finish its initial "seeding" before the
+# very first `snap install` call. On a fresh server snapd needs a bit of
+# time after being installed before it will accept snap commands; without
+# this wait, the very first run of this script tends to fail with
+# "device not yet seeded" and only succeeds on a second invocation.
+SNAP_SEED_WAIT_SECONDS="${SNAP_SEED_WAIT_SECONDS:-60}"
+
 DEPLOY_HOOK="/usr/local/sbin/remnanode-ip-cert-deploy.sh"
 LOG_FILE="/var/log/remnanode-ip-cert.log"
 STATUS_FILE="/var/log/remnanode-ip-cert.status"
@@ -179,6 +186,36 @@ certbot_bin() {
   fi
 }
 
+# Wait for snapd to finish its initial "seeding" (base snaps, apparmor
+# profiles, assertions, etc.). On a server where snapd was *just* installed,
+# calling `snap install ...` immediately tends to fail with:
+#   error: too early for operation, device not yet seeded or device model
+#   not acknowledged
+# This is the #1 reason this script fails on its very first run and then
+# succeeds on the second one (by the second run snapd has already seeded).
+wait_for_snap_seed() {
+  command -v snap >/dev/null 2>&1 || return 0
+
+  if snap wait system seed.loaded >/dev/null 2>&1; then
+    ok "snapd is seeded"
+    return 0
+  fi
+
+  info "waiting up to ${SNAP_SEED_WAIT_SECONDS}s for snapd to finish seeding"
+  local waited=0
+  while (( waited < SNAP_SEED_WAIT_SECONDS )); do
+    if snap wait system seed.loaded >/dev/null 2>&1; then
+      ok "snapd finished seeding after ${waited}s"
+      return 0
+    fi
+    sleep 3
+    waited=$((waited + 3))
+  done
+
+  warn "snapd did not report seeded after ${SNAP_SEED_WAIT_SECONDS}s, proceeding anyway"
+  return 0
+}
+
 install_certbot_via_snap() {
   command -v snap >/dev/null 2>&1 || {
     export DEBIAN_FRONTEND=noninteractive
@@ -186,6 +223,9 @@ install_certbot_via_snap() {
     apt-get install -y snapd || return 1
     systemctl enable --now snapd.socket >/dev/null 2>&1 || true
   }
+
+  wait_for_snap_seed
+
   snap install core >/dev/null 2>&1 || true
   snap refresh core >/dev/null 2>&1 || true
   if command -v apt-get >/dev/null 2>&1; then
@@ -193,12 +233,21 @@ install_certbot_via_snap() {
   fi
   snap install --classic certbot || return 1
   ln -sf /snap/bin/certbot /usr/bin/certbot
+  # Give the freshly mounted snap a moment before we start calling it.
+  sleep 2
   return 0
 }
 
 install_certbot_via_pip() {
   need_cmd python3
-  python3 -m venv /opt/certbot-venv || return 1
+  if ! python3 -m venv /opt/certbot-venv 2>/dev/null; then
+    # python3-venv is often missing on minimal images; try to install it
+    # before giving up.
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y || true
+    apt-get install -y python3-venv >/dev/null 2>&1 || true
+    python3 -m venv /opt/certbot-venv || return 1
+  fi
   /opt/certbot-venv/bin/pip install --upgrade pip >/dev/null
   /opt/certbot-venv/bin/pip install "certbot>=${CERTBOT_MIN_VERSION},<6" || return 1
   ln -sf /opt/certbot-venv/bin/certbot /usr/local/bin/certbot
@@ -442,11 +491,21 @@ issue_certificate() {
   mkdir -p "$CERT_DIR" "$(dirname "$LOG_FILE")"
   touch "$LOG_FILE" "$STATUS_FILE"
   trap print_summary EXIT
-  dockerpsq=$(docker ps -q)
-  if [[ -n "$dockerpsq" ]]; then
-    docker stop $dockerpsq
+
+  # Guarded: on a brand-new server docker may not exist yet at this point
+  # (it gets installed later by ensure_docker), so `docker ps` here would
+  # otherwise abort the whole script under `set -e` before certbot is even
+  # touched.
+  if command -v docker >/dev/null 2>&1; then
+    dockerpsq="$(docker ps -q || true)"
+    if [[ -n "$dockerpsq" ]]; then
+      docker stop $dockerpsq
+    fi
+    echo "ALLCONTSTOPPED"
+  else
+    info "docker not installed yet, nothing to stop"
   fi
-  echo "ALLCONTSTOPPED"
+
   # Mirror everything to the log file so the run can be followed with
   # `tail -f /var/log/remnanode-ip-cert.log` from a second SSH session.
   exec > >(tee -a "$LOG_FILE") 2>&1
@@ -524,8 +583,8 @@ issue_certificate() {
   echo
   ok "IP certificate issued and installed"
   echo "  cert: $DEFAULT_CERT_FILE"
-  rm /opt/remnanode/xray-ssl/privkey.key
-  cp /opt/remnanode/xray-ssl/privkey.pem /opt/remnanode/xray-ssl/privkey.key 
+  rm -f /opt/remnanode/xray-ssl/privkey.key
+  cp /opt/remnanode/xray-ssl/privkey.pem /opt/remnanode/xray-ssl/privkey.key
   echo "  key:  $DEFAULT_KEY_KEY -> COPIED $DEFAULT_KEY_PEM"
   echo
   echo "Panel / Xray inbound TLS settings should point to:"
@@ -651,7 +710,8 @@ Usage: $0 <command>
 Useful env vars: NODE_IP, LE_EMAIL, CERTBOT_STAGING=1, RESTART_ON_RENEW=0,
                  REMNANODE_DIR, REMNANODE_SERVICE_NAME, SELFSTEAL_NGINX_SERVICE_NAME,
                  MANAGE_REMNANODE=0 (skip creating/starting the container),
-                 REMNANODE_SECRET_KEY=... (avoid the interactive prompt).
+                 REMNANODE_SECRET_KEY=... (avoid the interactive prompt),
+                 SNAP_SEED_WAIT_SECONDS=60 (max wait for snapd seeding on first run).
 
 Track progress of a running 'issue'/'renew' from another SSH session with:
   tail -f ${LOG_FILE}
