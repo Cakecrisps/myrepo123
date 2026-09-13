@@ -65,8 +65,13 @@ STATUS_DEPLOY="PENDING";   NOTE_DEPLOY=""
 STATUS_TIMER="PENDING";    NOTE_TIMER=""
 
 die() { echo "FAIL: $*" >&2; exit 1; }
-ok()   { echo "OK: $*"; }
-info() { echo "-- $*"; }
+# ok()/info() MUST go to stderr, never stdout: several functions (ensure_certbot,
+# certbot_bin, detect_public_ip) are called as `x="$(fn)"` and rely on stdout
+# containing *only* their actual return value. Mixing status text into stdout
+# there silently corrupts the captured value (e.g. certbot path becomes a
+# multi-line string bash then fails to execute).
+ok()   { echo "OK: $*" >&2; }
+info() { echo "-- $*" >&2; }
 warn() { echo "WARN: $*" >&2; }
 
 step() {
