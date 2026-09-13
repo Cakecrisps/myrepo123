@@ -520,7 +520,7 @@ issue_certificate() {
   echo
   ok "IP certificate issued and installed"
   echo "  cert: $DEFAULT_CERT_FILE"
-  rm /opt/remnanode/xray-ssl/privkey,key
+  rm /opt/remnanode/xray-ssl/privkey.key
   cp /opt/remnanode/xray-ssl/privkey.pem /opt/remnanode/xray-ssl/privkey.key 
   echo "  key:  $DEFAULT_KEY_KEY -> COPIED $DEFAULT_KEY_PEM"
   echo
