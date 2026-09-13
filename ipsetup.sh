@@ -442,7 +442,10 @@ issue_certificate() {
   mkdir -p "$CERT_DIR" "$(dirname "$LOG_FILE")"
   touch "$LOG_FILE" "$STATUS_FILE"
   trap print_summary EXIT
-  docker stop $(docker ps -q)
+  dockerpsq=$(docker ps -q)
+  if [[ -n "$dockerpsq" ]]; then
+    docker stop $dockerpsq
+  fi
   echo "ALLCONTSTOPPED"
   # Mirror everything to the log file so the run can be followed with
   # `tail -f /var/log/remnanode-ip-cert.log` from a second SSH session.
