@@ -1,448 +1,457 @@
 #!/usr/bin/env bash
+# remnanode-ip-cert.sh
+#
+# Issues and auto-renews a Let's Encrypt IP-address certificate (the
+# "shortlived" ACME profile, ~160h / 6.67 days validity) for a RemnaNode
+# host, drops it into /opt/remnanode/xray-ssl/*.pem and restarts the
+# relevant docker containers whenever the certificate actually changes.
+#
+# Usage:
+#   sudo NODE_IP=1.2.3.4 LE_EMAIL=you@example.com bash remnanode-ip-cert.sh issue
+#   sudo bash remnanode-ip-cert.sh renew          # what the timer calls
+#   sudo bash remnanode-ip-cert.sh install-timer  # (re)install systemd timer only
+#   sudo bash remnanode-ip-cert.sh status
+#
 set -Eeuo pipefail
 
-SELFSTEAL_SCRIPT_URL="${SELFSTEAL_SCRIPT_URL:-https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh}"
+# ---------------------------------------------------------------------------
+# Configuration (all overridable via environment variables)
+# ---------------------------------------------------------------------------
 REMNANODE_DIR="${REMNANODE_DIR:-/opt/remnanode}"
-REMNANODE_IMAGE="${REMNANODE_IMAGE:-remnawave/node:3.1.0}"
 REMNANODE_SERVICE_NAME="${REMNANODE_SERVICE_NAME:-remnanode}"
-DEFAULT_NODE_PORT="${DEFAULT_NODE_PORT:-2222}"
-DEFAULT_SELFSTEAL_PORT="${DEFAULT_SELFSTEAL_PORT:-9443}"
-DEFAULT_SELFSTEAL_TEMPLATE="${DEFAULT_SELFSTEAL_TEMPLATE:-1}"
-SELFSTEAL_BASE_DOMAIN="${SELFSTEAL_BASE_DOMAIN:-pinkmoon.pro}"
-DEFAULT_SELFSTEAL_SUBDOMAIN="${DEFAULT_SELFSTEAL_SUBDOMAIN:-nld}"
-DEFAULT_SELFSTEAL_DOMAIN="${DEFAULT_SELFSTEAL_DOMAIN:-${DEFAULT_SELFSTEAL_SUBDOMAIN}.${SELFSTEAL_BASE_DOMAIN}}"
-CERT_REQUIRED_DNS_PATTERN="${CERT_REQUIRED_DNS_PATTERN:-*.pinkmoon.pro}"
-CERT_WAIT_SECONDS="${CERT_WAIT_SECONDS:-600}"
-CERT_HELPER_TAG="${CERT_HELPER_TAG:-}"
-CERT_HELPER_TAG_STRICT="${CERT_HELPER_TAG_STRICT:-0}"
-CERT_SYNC_ENABLED="${CERT_SYNC_ENABLED:-1}"
-CERT_SYNC_TIMER_ENABLED="${CERT_SYNC_TIMER_ENABLED:-1}"
-CERT_SYNC_ON_CALENDAR="${CERT_SYNC_ON_CALENDAR:-*-*-* 04:17:00}"
-CERT_SYNC_RANDOMIZED_DELAY_SECONDS="${CERT_SYNC_RANDOMIZED_DELAY_SECONDS:-3600}"
 SELFSTEAL_NGINX_SERVICE_NAME="${SELFSTEAL_NGINX_SERVICE_NAME:-nginx-selfsteal}"
 SELFSTEAL_NGINX_SSL_DIR="${SELFSTEAL_NGINX_SSL_DIR:-/opt/nginx-selfsteal/ssl}"
+CERT_DIR="${CERT_DIR:-$REMNANODE_DIR/xray-ssl}"
+COMPOSE_FILE="${COMPOSE_FILE:-$REMNANODE_DIR/docker-compose.yml}"
 
-CERT_DIR="$REMNANODE_DIR/xray-ssl"
-COMPOSE_FILE="$REMNANODE_DIR/docker-compose.yml"
+NODE_IP="${NODE_IP:-${REMNANODE_IP:-}}"
+LE_EMAIL="${LE_EMAIL:-}"
+CERTBOT_STAGING="${CERTBOT_STAGING:-0}"          # 1 = use LE staging (untrusted, for testing)
+CERTBOT_MIN_VERSION="${CERTBOT_MIN_VERSION:-5.4.0}"
+HTTP01_PORT="${HTTP01_PORT:-80}"
+RESTART_ON_RENEW="${RESTART_ON_RENEW:-1}"        # 1 = docker restart remnanode(+nginx-selfsteal) after real renewal
+
+# RemnaNode container management (only used if $COMPOSE_FILE doesn't exist yet
+# or the container isn't running — mirrors moonsetup.sh's write_remnanode_files/start_remnanode)
+MANAGE_REMNANODE="${MANAGE_REMNANODE:-1}"        # 0 = never touch/create the remnanode container
+REMNANODE_IMAGE="${REMNANODE_IMAGE:-remnawave/node:3.1.0}"
+DEFAULT_NODE_PORT="${DEFAULT_NODE_PORT:-2222}"
+REMNANODE_SECRET_KEY="${REMNANODE_SECRET_KEY:-}"
+
+RENEW_ON_CALENDAR="${RENEW_ON_CALENDAR:-*-*-* 0/6:00:00}"   # every 6h
+RENEW_RANDOMIZED_DELAY_SECONDS="${RENEW_RANDOMIZED_DELAY_SECONDS:-1800}"
+
+# How long to wait for snapd to finish its initial "seeding" before the
+# very first `snap install` call. On a fresh server snapd needs a bit of
+# time after being installed before it will accept snap commands; without
+# this wait, the very first run of this script tends to fail with
+# "device not yet seeded" and only succeeds on a second invocation.
+SNAP_SEED_WAIT_SECONDS="${SNAP_SEED_WAIT_SECONDS:-60}"
+
+# Set by ensure_certbot() (as a plain variable assignment, NOT via command
+# substitution) so that:
+#  (a) set_status CERTBOT ... calls inside ensure_certbot actually affect the
+#      real shell and are reflected in the final checklist, and
+#  (b) nothing an installer (snap/pip/apt) prints to stdout can ever leak
+#      into the resolved certbot path (which happened before: `snap install
+#      --classic certbot` prints normal status lines to stdout, and when
+#      ensure_certbot was called as `certbot="$(ensure_certbot)"`, those
+#      lines got appended into $certbot, producing a garbage multi-line
+#      "path" that then failed with "File name too long" when executed).
+CERTBOT_BIN=""
+
+DEPLOY_HOOK="/usr/local/sbin/remnanode-ip-cert-deploy.sh"
+LOG_FILE="/var/log/remnanode-ip-cert.log"
+STATUS_FILE="/var/log/remnanode-ip-cert.status"
+LOCK_FILE="/run/remnanode-ip-cert.lock"
+
+SERVICE_FILE="/etc/systemd/system/remnanode-ip-cert-renew.service"
+TIMER_FILE="/etc/systemd/system/remnanode-ip-cert-renew.timer"
+
 DEFAULT_CERT_FILE="$CERT_DIR/fullchain.pem"
 DEFAULT_KEY_PEM="$CERT_DIR/privkey.pem"
 DEFAULT_KEY_KEY="$CERT_DIR/privkey.key"
 
-STATUS_NODE="PENDING"
-STATUS_SELFSTEAL="PENDING"
-STATUS_OPTIMIZATION="PENDING"
-STATUS_SCANNER="PENDING"
-NOTE_NODE=""
-NOTE_SELFSTEAL=""
-NOTE_OPTIMIZATION=""
-NOTE_SCANNER=""
-RUN_NODE=1
-RUN_SELFSTEAL=1
-RUN_OPTIMIZATION=1
-RUN_SCANNER=1
-RUN_CERT_SYNC=0
-INSTALL_MODE_NAME="full"
+# ---------------------------------------------------------------------------
+# Progress / status tracking
+#
+# Every stage of `issue` updates both the on-screen checklist and
+# $STATUS_FILE, so the task can be followed from a *second* SSH session
+# with:   watch -n2 cat /var/log/remnanode-ip-cert.status
+# or:     tail -f /var/log/remnanode-ip-cert.log
+# ---------------------------------------------------------------------------
+STEP_TOTAL=7
+STEP_CURRENT=0
+
+STATUS_CERTBOT="PENDING";  NOTE_CERTBOT=""
+STATUS_IP="PENDING";       NOTE_IP=""
+STATUS_PORT80="PENDING";   NOTE_PORT80=""
+STATUS_ISSUE="PENDING";    NOTE_ISSUE=""
+STATUS_DEPLOY="PENDING";   NOTE_DEPLOY=""
+STATUS_REMNANODE="PENDING"; NOTE_REMNANODE=""
+STATUS_TIMER="PENDING";    NOTE_TIMER=""
 
 die() { echo "FAIL: $*" >&2; exit 1; }
-ok() { echo "OK: $*"; }
-info() { echo "-- $*"; }
-warn() { echo "WARN: $*"; }
+# ok()/info() MUST go to stderr, never stdout: certbot_bin() and
+# detect_public_ip() are called as `x="$(fn)"` and rely on stdout containing
+# *only* their actual return value. Mixing status text into stdout there
+# silently corrupts the captured value (e.g. certbot path becomes a
+# multi-line string bash then fails to execute — this is exactly what used
+# to happen with ensure_certbot() before it was switched to setting the
+# CERTBOT_BIN global instead of being called via command substitution).
+ok()   { echo "OK: $*" >&2; }
+info() { echo "-- $*" >&2; }
+warn() { echo "WARN: $*" >&2; }
 
-wait_for_apt_locks() {
-  local timeout="${1:-600}"
-  local waited=0
-  local interval=5
+step() {
+  STEP_CURRENT=$((STEP_CURRENT + 1))
+  echo
+  echo "[${STEP_CURRENT}/${STEP_TOTAL}] $*"
+}
 
-  if ! command -v fuser >/dev/null 2>&1; then
-    warn "fuser is not available; skipping apt lock wait"
-    return 0
-  fi
+# set_status <VAR_SUFFIX> <PENDING|IN_PROGRESS|OK|FAIL> [note]
+set_status() {
+  local suffix="$1" value="$2" note="${3:-}"
+  printf -v "STATUS_${suffix}" '%s' "$value"
+  printf -v "NOTE_${suffix}" '%s' "$note"
+  {
+    echo "$(date -u +%FT%TZ) ${suffix}=${value}${note:+ (${note})}"
+  } >> "$STATUS_FILE" 2>/dev/null || true
+}
 
-  while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
-    || fuser /var/lib/dpkg/lock >/dev/null 2>&1 \
-    || fuser /var/cache/apt/archives/lock >/dev/null 2>&1 \
-    || fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do
-    if (( waited == 0 )); then
-      warn "apt/dpkg is busy (likely unattended-upgrades), waiting for lock release..."
-    fi
-    if (( waited >= timeout )); then
-      die "apt/dpkg lock was not released in ${timeout}s"
-    fi
-    sleep "$interval"
-    waited=$((waited + interval))
-  done
+print_summary() {
+  local rc=$?
+  echo
+  echo "================ RemnaNode IP-cert: checklist ================"
+  printf '  %-18s %s\n' "certbot:"        "${STATUS_CERTBOT}${NOTE_CERTBOT:+ (${NOTE_CERTBOT})}"
+  printf '  %-18s %s\n' "public IP:"      "${STATUS_IP}${NOTE_IP:+ (${NOTE_IP})}"
+  printf '  %-18s %s\n' "port 80 check:"  "${STATUS_PORT80}${NOTE_PORT80:+ (${NOTE_PORT80})}"
+  printf '  %-18s %s\n' "issue cert:"     "${STATUS_ISSUE}${NOTE_ISSUE:+ (${NOTE_ISSUE})}"
+  printf '  %-18s %s\n' "deploy cert:"    "${STATUS_DEPLOY}${NOTE_DEPLOY:+ (${NOTE_DEPLOY})}"
+  printf '  %-18s %s\n' "remnanode up:"   "${STATUS_REMNANODE}${NOTE_REMNANODE:+ (${NOTE_REMNANODE})}"
+  printf '  %-18s %s\n' "renew timer:"    "${STATUS_TIMER}${NOTE_TIMER:+ (${NOTE_TIMER})}"
+  echo "================================================================"
+  echo "Full log:    ${LOG_FILE}"
+  echo "Status file: ${STATUS_FILE}  (tail -f it from another session to follow progress)"
+  return "$rc"
+}
 
-  if (( waited > 0 )); then
-    ok "apt/dpkg lock released after ${waited}s"
-  fi
+require_root() {
+  [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "run as root (sudo -i)"
 }
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
 }
 
-require_root() {
-  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-    die "run as root (sudo -i)"
-  fi
-}
-
 trim() {
-  local value="${1:-}"
-  value="${value#"${value%%[![:space:]]*}"}"
-  value="${value%"${value##*[![:space:]]}"}"
-  printf '%s' "$value"
+  local v="${1:-}"
+  v="${v#"${v%%[![:space:]]*}"}"
+  v="${v%"${v##*[![:space:]]}"}"
+  printf '%s' "$v"
 }
 
-prompt_default() {
-  local var_name="$1"
-  local question="$2"
-  local default_value="$3"
-  local value=""
-  read -r -p "$question" value || true
-  value="$(trim "$value")"
-  if [[ -z "$value" ]]; then
-    value="$default_value"
-  fi
-  printf -v "$var_name" '%s' "$value"
+# semver-ish comparison: returns 0 (true) if $1 >= $2
+version_ge() {
+  [[ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n1)" == "$2" ]]
 }
 
-normalize_selfsteal_domain() {
-  local value
-  local base
-
-  value="$(trim "${1:-}")"
-  base="$(trim "${SELFSTEAL_BASE_DOMAIN:-}")"
-  base="${base#.}"
-
-  if [[ -z "$value" ]]; then
-    return 0
-  fi
-
-  if [[ "$value" != *.* && -n "$base" ]]; then
-    printf '%s.%s' "$value" "$base"
-    return 0
-  fi
-
-  printf '%s' "$value"
-}
-
-selfsteal_domain_prompt_value() {
-  local domain
-  local base
-  local suffix
-  local subdomain
-
-  domain="$(normalize_selfsteal_domain "${1:-}")"
-  base="$(trim "${SELFSTEAL_BASE_DOMAIN:-}")"
-  base="${base#.}"
-  suffix=".${base}"
-
-  if [[ -n "$base" && "$domain" == *"$suffix" ]]; then
-    subdomain="${domain%"$suffix"}"
-    if [[ -n "$subdomain" && "$subdomain" != *.* ]]; then
-      printf '%s' "$subdomain"
-      return 0
-    fi
-  fi
-
-  printf '%s' "$domain"
-}
-
-detect_selfsteal_domain_from_active_config() {
-  local log_file="/tmp/remnanode-servername-detect.log"
-  local detected=""
-
-  if ! docker ps --format '{{.Names}}' | grep -qx "$REMNANODE_SERVICE_NAME"; then
-    return 1
-  fi
-
-  if ! detected="$(docker exec -i \
-    -e BASE_DOMAIN="$SELFSTEAL_BASE_DOMAIN" \
-    -e CERT_TAG="$CERT_HELPER_TAG" \
-    -e CERT_TAG_STRICT="$CERT_HELPER_TAG_STRICT" \
-    "$REMNANODE_SERVICE_NAME" sh 2>"$log_file" <<'EOSH'
-set -eu
-
-SOCK="$(tr '\0' '\n' </proc/1/environ | sed -n 's/^INTERNAL_SOCKET_PATH=//p' | head -n1)"
-TOK="$(tr '\0' '\n' </proc/1/environ | sed -n 's/^INTERNAL_REST_TOKEN=//p' | head -n1)"
-[ -n "$SOCK" ] && [ -n "$TOK" ] || exit 11
-
-SOCK="$SOCK" TOK="$TOK" BASE_DOMAIN="${BASE_DOMAIN:-}" CERT_TAG="${CERT_TAG:-}" CERT_TAG_STRICT="${CERT_TAG_STRICT:-0}" node <<'NODE'
-const http = require('http');
-
-const socketPath = process.env.SOCK;
-const token = process.env.TOK;
-const baseDomain = (process.env.BASE_DOMAIN || '').trim().toLowerCase().replace(/^\./, '');
-const certTag = (process.env.CERT_TAG || '').trim();
-const certTagStrict = (process.env.CERT_TAG_STRICT || '').trim() === '1';
-
-function isApiInbound(ib) {
-  const tag = String(ib?.tag || '').toUpperCase();
-  return tag === 'REMNAWAVE_API_INBOUND' || tag.includes('API_INBOUND');
-}
-
-function isBaseDomainMatch(name) {
-  const lower = name.toLowerCase();
-  return baseDomain && (lower === baseDomain || lower.endsWith(`.${baseDomain}`));
-}
-
-http.get({ socketPath, path: `/internal/get-config?token=${token}` }, (res) => {
-  let raw = '';
-  res.on('data', (chunk) => {
-    raw += chunk;
-  });
-  res.on('end', () => {
-    let cfg;
-    try {
-      cfg = JSON.parse(raw || '{}');
-    } catch {
-      process.exit(12);
-    }
-
-    const inbounds = Array.isArray(cfg?.inbounds) ? cfg.inbounds : [];
-    const candidates = [];
-
-    inbounds.forEach((ib, inboundIndex) => {
-      if (certTagStrict && certTag && ib?.tag !== certTag) return;
-
-      const names = ib?.streamSettings?.realitySettings?.serverNames;
-      if (!Array.isArray(names)) return;
-
-      names.forEach((rawName, nameIndex) => {
-        const name = String(rawName || '').trim();
-        if (!name || name.includes('*')) return;
-
-        let score = 0;
-        if (certTag && ib?.tag === certTag) score += 1000;
-        if (!isApiInbound(ib)) score += 100;
-        if (isBaseDomainMatch(name)) score += 50;
-        if (Number(ib?.port) === 443) score += 10;
-
-        candidates.push({ name, score, order: inboundIndex * 1000 + nameIndex });
-      });
-    });
-
-    if (candidates.length === 0) {
-      process.exit(13);
-    }
-
-    candidates.sort((a, b) => b.score - a.score || a.order - b.order);
-    process.stdout.write(candidates[0].name);
-  });
-}).on('error', () => {
-  process.exit(14);
-});
-NODE
-EOSH
-  )"; then
-    return 1
-  fi
-
-  detected="$(trim "$detected")"
-  [[ -n "$detected" ]] || return 1
-  printf '%s' "$detected"
-}
-
-is_int() {
-  [[ "${1:-}" =~ ^[0-9]+$ ]]
-}
-
-is_int_1_11() {
-  [[ "${1:-}" =~ ^([1-9]|1[0-1])$ ]]
-}
-
-set_install_mode_flags() {
-  local mode="$1"
-  case "$mode" in
-    1)
-      RUN_NODE=1
-      RUN_SELFSTEAL=1
-      RUN_OPTIMIZATION=1
-      RUN_SCANNER=1
-      INSTALL_MODE_NAME="full"
-      ;;
-    2)
-      RUN_NODE=1
-      RUN_SELFSTEAL=0
-      RUN_OPTIMIZATION=0
-      RUN_SCANNER=0
-      INSTALL_MODE_NAME="remnanode_only"
-      ;;
-    3)
-      RUN_NODE=0
-      RUN_SELFSTEAL=1
-      RUN_OPTIMIZATION=0
-      RUN_SCANNER=0
-      INSTALL_MODE_NAME="selfsteal_only"
-      ;;
-    4)
-      RUN_NODE=1
-      RUN_SELFSTEAL=1
-      RUN_OPTIMIZATION=0
-      RUN_SCANNER=0
-      INSTALL_MODE_NAME="node_and_selfsteal"
-      ;;
-    5)
-      RUN_NODE=1
-      RUN_SELFSTEAL=0
-      RUN_OPTIMIZATION=1
-      RUN_SCANNER=1
-      INSTALL_MODE_NAME="node_opt_scanner"
-      ;;
-    6)
-      RUN_NODE=0
-      RUN_SELFSTEAL=0
-      RUN_OPTIMIZATION=1
-      RUN_SCANNER=1
-      INSTALL_MODE_NAME="opt_and_scanner_only"
-      ;;
-    7)
-      RUN_NODE=0
-      RUN_SELFSTEAL=0
-      RUN_OPTIMIZATION=1
-      RUN_SCANNER=0
-      INSTALL_MODE_NAME="optimization_only"
-      ;;
-    8)
-      RUN_NODE=0
-      RUN_SELFSTEAL=0
-      RUN_OPTIMIZATION=0
-      RUN_SCANNER=1
-      INSTALL_MODE_NAME="scanner_only"
-      ;;
-    9)
-      RUN_NODE=0
-      RUN_SELFSTEAL=0
-      RUN_OPTIMIZATION=0
-      RUN_SCANNER=0
-      RUN_CERT_SYNC=1
-      INSTALL_MODE_NAME="cert_sync_only"
-      ;;
-    *)
-      return 1
-      ;;
-  esac
+is_ipv4() {
+  local ip="${1:-}"
+  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  local IFS=.
+  local -a o=($ip)
+  for part in "${o[@]}"; do
+    (( part >= 0 && part <= 255 )) || return 1
+  done
   return 0
 }
 
-select_install_mode() {
-  local mode="${INSTALL_MODE:-}"
-  mode="$(trim "$mode")"
-
-  if [[ -z "$mode" ]]; then
-    echo
-    echo "Select installation mode:"
-    echo "  1) Full install (remnanode + selfsteal + optimization + scanner protection)"
-    echo "  2) Only remnanode"
-    echo "  3) Only selfsteal"
-    echo "  4) Remnanode + selfsteal"
-    echo "  5) Remnanode + optimization + scanner protection"
-    echo "  6) Only optimization + scanner protection"
-    echo "  7) Only optimization (BBR)"
-    echo "  8) Only scanner protection (traffic-guard)"
-    echo "  9) Only selfsteal cert sync timer"
-    read -r -p "Mode [1]: " mode || true
-    mode="$(trim "$mode")"
-  fi
-
-  if [[ -z "$mode" ]]; then
-    mode="1"
-  fi
-
-  set_install_mode_flags "$mode" || die "invalid mode: $mode"
-  ok "selected mode: ${mode} (${INSTALL_MODE_NAME})"
-}
-
-mark_skipped_steps() {
-  if [[ "$RUN_NODE" -eq 0 ]]; then
-    STATUS_NODE="SKIPPED"
-    NOTE_NODE="not selected"
-  fi
-  if [[ "$RUN_SELFSTEAL" -eq 0 ]]; then
-    STATUS_SELFSTEAL="SKIPPED"
-    NOTE_SELFSTEAL="not selected"
-  fi
-  if [[ "$RUN_OPTIMIZATION" -eq 0 ]]; then
-    STATUS_OPTIMIZATION="SKIPPED"
-    NOTE_OPTIMIZATION="not selected"
-  fi
-  if [[ "$RUN_SCANNER" -eq 0 ]]; then
-    STATUS_SCANNER="SKIPPED"
-    NOTE_SCANNER="not selected"
-  fi
-}
-
-print_summary() {
-  echo
-  echo "Checklist:"
-  echo "- Нода: ${STATUS_NODE}${NOTE_NODE:+ (${NOTE_NODE})}"
-  echo "- Селфстил: ${STATUS_SELFSTEAL}${NOTE_SELFSTEAL:+ (${NOTE_SELFSTEAL})}"
-  echo "- Оптимизация сервера: ${STATUS_OPTIMIZATION}${NOTE_OPTIMIZATION:+ (${NOTE_OPTIMIZATION})}"
-  echo "- Защита от сканеров: ${STATUS_SCANNER}${NOTE_SCANNER:+ (${NOTE_SCANNER})}"
-}
-trap print_summary EXIT
-
-backup_if_exists() {
-  local file="$1"
-  if [[ -f "$file" ]]; then
-    local ts
-    ts="$(date +%Y%m%d_%H%M%S)"
-    cp "$file" "${file}.bak_${ts}"
-    ok "backup created: ${file}.bak_${ts}"
-  fi
-}
-
-install_docker_if_needed() {
-  if command -v docker >/dev/null 2>&1; then
-    ok "docker is already installed"
-  else
-    info "installing docker via official script"
-    curl -fsSL https://get.docker.com | sh
-    ok "docker installed"
-  fi
-
-  ensure_docker_compose_v2 || die "docker compose v2 is required"
-}
-
-ensure_docker_compose_v2() {
-  if docker compose version >/dev/null 2>&1; then
-    ok "docker compose v2 is available"
-    return 0
-  fi
-
-  warn "docker compose v2 is not available; attempting to install compose plugin"
-
-  if command -v apt-get >/dev/null 2>&1; then
-    export DEBIAN_FRONTEND=noninteractive
-    wait_for_apt_locks 900
-    apt-get update -y || true
-    wait_for_apt_locks 900
-    if ! apt-get install -y docker-compose-plugin >/tmp/remnanode-compose-install.log 2>&1; then
-      apt-get install -y docker-compose-v2 >>/tmp/remnanode-compose-install.log 2>&1 || true
+# ---------------------------------------------------------------------------
+# Public IP detection
+# ---------------------------------------------------------------------------
+detect_public_ip() {
+  local ip=""
+  for url in "https://api.ipify.org" "https://ifconfig.me/ip" "https://icanhazip.com"; do
+    ip="$(curl -4 -fsS --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]' || true)"
+    if is_ipv4 "$ip"; then
+      printf '%s' "$ip"
+      return 0
     fi
-  fi
-
-  if docker compose version >/dev/null 2>&1; then
-    ok "docker compose v2 installed"
-    return 0
-  fi
-
-  warn "failed to install docker compose v2 automatically"
-  tail -n 20 /tmp/remnanode-compose-install.log 2>/dev/null || true
+  done
   return 1
 }
 
-write_remnanode_files() {
+# ---------------------------------------------------------------------------
+# certbot installation / version control
+#
+# apt's certbot is almost always too old for --ip-address / IP webroot
+# support (needs certbot >= 5.3, ideally >= 5.4). We install via the
+# official EFF-recommended snap channel, which auto-updates itself, and
+# fall back to a dedicated pip venv if snapd is unavailable.
+# ---------------------------------------------------------------------------
+certbot_bin() {
+  if [[ -x /snap/bin/certbot ]]; then
+    printf '/snap/bin/certbot'
+  elif [[ -x /opt/certbot-venv/bin/certbot ]]; then
+    printf '/opt/certbot-venv/bin/certbot'
+  elif command -v certbot >/dev/null 2>&1; then
+    command -v certbot
+  fi
+}
+
+# Wait for snapd to finish its initial "seeding" (base snaps, apparmor
+# profiles, assertions, etc.). On a server where snapd was *just* installed,
+# calling `snap install ...` immediately tends to fail with:
+#   error: too early for operation, device not yet seeded or device model
+#   not acknowledged
+# This is the #1 reason this script fails on its very first run and then
+# succeeds on the second one (by the second run snapd has already seeded).
+wait_for_snap_seed() {
+  command -v snap >/dev/null 2>&1 || return 0
+
+  if snap wait system seed.loaded >/dev/null 2>&1; then
+    ok "snapd is seeded"
+    return 0
+  fi
+
+  info "waiting up to ${SNAP_SEED_WAIT_SECONDS}s for snapd to finish seeding"
+  local waited=0
+  while (( waited < SNAP_SEED_WAIT_SECONDS )); do
+    if snap wait system seed.loaded >/dev/null 2>&1; then
+      ok "snapd finished seeding after ${waited}s"
+      return 0
+    fi
+    sleep 3
+    waited=$((waited + 3))
+  done
+
+  warn "snapd did not report seeded after ${SNAP_SEED_WAIT_SECONDS}s, proceeding anyway"
+  return 0
+}
+
+install_certbot_via_snap() {
+  # NOTE: every external command below is redirected so it cannot write to
+  # *this function's* stdout. This function only ever runs as part of
+  # ensure_certbot(), and stdout chatter here has previously corrupted the
+  # resolved certbot path (see CERTBOT_BIN comment above) — keep it that way
+  # even if this function is refactored later.
+  command -v snap >/dev/null 2>&1 || {
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y >&2 || true
+    apt-get install -y snapd >&2 || return 1
+    systemctl enable --now snapd.socket >/dev/null 2>&1 || true
+  }
+
+  wait_for_snap_seed
+
+  snap install core >/dev/null 2>&1 || true
+  snap refresh core >/dev/null 2>&1 || true
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get remove -y certbot >/dev/null 2>&1 || true
+  fi
+  snap install --classic certbot >&2 || return 1
+  ln -sf /snap/bin/certbot /usr/bin/certbot
+  # Give the freshly mounted snap a moment before we start calling it.
+  sleep 2
+  return 0
+}
+
+install_certbot_via_pip() {
+  need_cmd python3
+  if ! python3 -m venv /opt/certbot-venv >&2; then
+    # python3-venv is often missing on minimal images; try to install it
+    # before giving up.
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y >&2 || true
+    apt-get install -y python3-venv >/dev/null 2>&1 || true
+    python3 -m venv /opt/certbot-venv >&2 || return 1
+  fi
+  /opt/certbot-venv/bin/pip install --upgrade pip >&2
+  /opt/certbot-venv/bin/pip install "certbot>=${CERTBOT_MIN_VERSION},<6" >&2 || return 1
+  ln -sf /opt/certbot-venv/bin/certbot /usr/local/bin/certbot
+  return 0
+}
+
+ensure_certbot() {
+  set_status CERTBOT IN_PROGRESS
+  local bin
+  bin="$(certbot_bin || true)"
+
+  if [[ -z "$bin" ]]; then
+    info "certbot not found, installing via snap (auto-updating channel)"
+    if ! install_certbot_via_snap; then
+      warn "snap install failed, falling back to pip venv"
+      if ! install_certbot_via_pip; then
+        set_status CERTBOT FAIL "install via snap and pip both failed"
+        die "failed to install certbot via snap and pip"
+      fi
+    fi
+    bin="$(certbot_bin || true)"
+  fi
+  if [[ -z "$bin" ]]; then
+    set_status CERTBOT FAIL "binary not found after install"
+    die "certbot binary not found after install"
+  fi
+
+  local ver
+  ver="$("$bin" --version 2>/dev/null | awk '{print $2}')"
+  if [[ -z "$ver" ]]; then
+    set_status CERTBOT FAIL "could not parse '$bin --version'"
+    die "unable to determine certbot version from '$bin --version'"
+  fi
+
+  if ! version_ge "$ver" "$CERTBOT_MIN_VERSION"; then
+    warn "certbot $ver is older than required $CERTBOT_MIN_VERSION, attempting upgrade"
+    if [[ "$bin" == "/snap/bin/certbot" ]]; then
+      snap refresh certbot >&2 || true
+    elif [[ "$bin" == "/opt/certbot-venv/bin/certbot" ]]; then
+      /opt/certbot-venv/bin/pip install --upgrade "certbot>=${CERTBOT_MIN_VERSION},<6" >&2 || true
+    fi
+    ver="$("$bin" --version 2>/dev/null | awk '{print $2}')"
+    if ! version_ge "$ver" "$CERTBOT_MIN_VERSION"; then
+      set_status CERTBOT FAIL "stuck at $ver, need >=$CERTBOT_MIN_VERSION"
+      die "certbot $ver still below required $CERTBOT_MIN_VERSION (IP-address certs need >=5.3, webroot-for-IP needs >=5.4)"
+    fi
+  fi
+
+  set_status CERTBOT OK "v$ver at $bin"
+  ok "certbot $ver is available at $bin (>= required $CERTBOT_MIN_VERSION)"
+  # IMPORTANT: assign to the global instead of `printf`-ing to stdout. This
+  # function must be called as a plain statement (`ensure_certbot`), never
+  # as `x="$(ensure_certbot)"` — see the CERTBOT_BIN comment near the top
+  # of this file for why that command-substitution pattern is unsafe here.
+  CERTBOT_BIN="$bin"
+}
+
+# ---------------------------------------------------------------------------
+# Port 80 sanity check (standalone HTTP-01 authenticator needs it free)
+# ---------------------------------------------------------------------------
+ensure_port80_free() {
+  need_cmd ss
+  local listeners
+  listeners="$(ss -H -ltnp "( sport = :${HTTP01_PORT} )" 2>/dev/null || true)"
+  if [[ -n "$listeners" ]]; then
+    echo "$listeners"
+    set_status PORT80 FAIL "port ${HTTP01_PORT} already in use"
+    die "port ${HTTP01_PORT} is already in use; free it (or set HTTP01_PORT to another port that is reachable from the internet on 80) before issuing/renewing"
+  fi
+  set_status PORT80 OK "port ${HTTP01_PORT} is free"
+}
+
+# ---------------------------------------------------------------------------
+# Deploy hook: installs the freshly (re)issued cert into place and restarts
+# whatever needs the new files. Certbot only calls --deploy-hook when a
+# certificate is *actually* renewed, never on a no-op check, and it also
+# persists the hook path into the lineage's renewal config, so any future
+# `certbot renew` (ours or a generic one) will keep calling it.
+# ---------------------------------------------------------------------------
+write_deploy_hook_script() {
+  mkdir -p "$(dirname "$DEPLOY_HOOK")"
+  cat > "$DEPLOY_HOOK" <<EOF2
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+CERT_DIR="${CERT_DIR}"
+SELFSTEAL_NGINX_SSL_DIR="${SELFSTEAL_NGINX_SSL_DIR}"
+REMNANODE_SERVICE_NAME="${REMNANODE_SERVICE_NAME}"
+SELFSTEAL_NGINX_SERVICE_NAME="${SELFSTEAL_NGINX_SERVICE_NAME}"
+COMPOSE_FILE="${COMPOSE_FILE}"
+RESTART_ON_RENEW="${RESTART_ON_RENEW}"
+LOG_FILE="${LOG_FILE}"
+LOCK_FILE="${LOCK_FILE}"
+
+log() { echo "[\$(date -u +%FT%TZ)] \$*" | tee -a "\$LOG_FILE" >&2; }
+
+# certbot sets RENEWED_LINEAGE when calling this as --deploy-hook. Allow a
+# manual override as \$1 for the very first (non-renewal) issuance.
+LINEAGE="\${RENEWED_LINEAGE:-\${1:-}}"
+[[ -n "\$LINEAGE" && -d "\$LINEAGE" ]] || { log "FAIL: no lineage directory given"; exit 1; }
+
+exec 9>"\$LOCK_FILE"
+flock -n 9 || { log "another deploy run is in progress, skipping"; exit 0; }
+
+mkdir -p "\$CERT_DIR"
+stamp="\$(date -u +%Y%m%dT%H%M%SZ)"
+if [[ -f "\$CERT_DIR/fullchain.pem" ]]; then
+  cp -a "\$CERT_DIR" "\${CERT_DIR}.backup.\$stamp"
+fi
+
+install -m 0644 "\$LINEAGE/fullchain.pem" "\$CERT_DIR/fullchain.pem"
+install -m 0600 "\$LINEAGE/privkey.pem"   "\$CERT_DIR/privkey.pem"
+# NOTE: this used to be `ln -sfn "\$CERT_DIR/privkey.pem" "\$CERT_DIR/privkey.key"`.
+# That breaks inside the remnanode container: \$CERT_DIR is an absolute
+# *host* path (e.g. /opt/remnanode/xray-ssl/privkey.pem), and a symlink just
+# stores that string verbatim. Docker bind-mounts \$CERT_DIR to a different
+# path inside the container (/var/lib/remnawave/configs/xray/ssl), which has
+# no /opt/remnanode/... directory at all in its namespace, so the symlink
+# target can't be resolved there -> xray fails with "no such file or
+# directory" on privkey.key after every restart. A real file copy has no
+# such problem since it doesn't encode any path.
+install -m 0600 "\$LINEAGE/privkey.pem"   "\$CERT_DIR/privkey.key"
+log "installed cert from \$LINEAGE into \$CERT_DIR"
+
+if [[ -d "\$SELFSTEAL_NGINX_SSL_DIR" ]]; then
+  install -m 0644 "\$LINEAGE/fullchain.pem" "\$SELFSTEAL_NGINX_SSL_DIR/fullchain.crt"
+  install -m 0600 "\$LINEAGE/privkey.pem"   "\$SELFSTEAL_NGINX_SSL_DIR/private.key"
+  log "installed cert into \$SELFSTEAL_NGINX_SSL_DIR"
+  if docker ps --format '{{.Names}}' | grep -qx "\$SELFSTEAL_NGINX_SERVICE_NAME"; then
+    if docker exec "\$SELFSTEAL_NGINX_SERVICE_NAME" nginx -t >>"\$LOG_FILE" 2>&1; then
+      docker exec "\$SELFSTEAL_NGINX_SERVICE_NAME" nginx -s reload >>"\$LOG_FILE" 2>&1 || true
+      log "nginx-selfsteal config test ok, reloaded"
+    else
+      log "WARN: nginx -t failed inside \$SELFSTEAL_NGINX_SERVICE_NAME, not reloading"
+    fi
+  fi
+fi
+
+if [[ "\$RESTART_ON_RENEW" == "1" ]]; then
+  if docker ps --format '{{.Names}}' | grep -qx "\$REMNANODE_SERVICE_NAME"; then
+    if [[ -f "\$COMPOSE_FILE" ]]; then
+      ( cd "\$(dirname "\$COMPOSE_FILE")" && docker compose restart "\$REMNANODE_SERVICE_NAME" ) >>"\$LOG_FILE" 2>&1
+    else
+      docker restart "\$REMNANODE_SERVICE_NAME" >>"\$LOG_FILE" 2>&1
+    fi
+    log "restarted \$REMNANODE_SERVICE_NAME to pick up new certificate"
+  fi
+fi
+
+log "deploy completed successfully"
+EOF2
+  chmod 0755 "$DEPLOY_HOOK"
+  ok "deploy hook written: $DEPLOY_HOOK"
+}
+
+# ---------------------------------------------------------------------------
+# RemnaNode container: install docker if needed, write a minimal compose file
+# only if one doesn't already exist, and make sure the container is up.
+# (Mirrors write_remnanode_files/start_remnanode from moonsetup.sh — if you
+# already ran moonsetup.sh, $COMPOSE_FILE exists and this just does
+# `docker compose up -d` / leaves your file untouched.)
+# ---------------------------------------------------------------------------
+ensure_docker() {
+  if ! command -v docker >/dev/null 2>&1; then
+    info "docker not found, installing via get.docker.com"
+    curl -fsSL https://get.docker.com | sh
+  fi
+  command -v docker >/dev/null 2>&1 || die "docker installation failed"
+
+  if ! docker compose version >/dev/null 2>&1; then
+    info "docker compose v2 not found, installing plugin"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y || true
+    apt-get install -y docker-compose-plugin || apt-get install -y docker-compose-v2 || true
+  fi
+  docker compose version >/dev/null 2>&1 || die "docker compose v2 is required but could not be installed"
+}
+
+write_remnanode_compose() {
   local secret_key="$1"
-  local escaped_secret=""
+  local escaped_secret="${secret_key//\\/\\\\}"
+  escaped_secret="${escaped_secret//\"/\\\"}"
 
   mkdir -p "$REMNANODE_DIR" "$CERT_DIR"
   chmod 700 "$CERT_DIR" || true
-
-  backup_if_exists "$COMPOSE_FILE"
-  escaped_secret="${secret_key//\\/\\\\}"
-  escaped_secret="${escaped_secret//\"/\\\"}"
 
   cat > "$COMPOSE_FILE" <<EOF2
 services:
@@ -464,1032 +473,284 @@ EOF2
   ok "written: $COMPOSE_FILE"
 }
 
-start_remnanode() {
-  info "starting remnanode"
-  (
-    cd "$REMNANODE_DIR"
-    docker compose up -d
-    docker compose ps "$REMNANODE_SERVICE_NAME"
-  )
-}
+ensure_remnanode_running() {
+  if [[ "$MANAGE_REMNANODE" != "1" ]]; then
+    set_status REMNANODE OK "MANAGE_REMNANODE=0, skipped"
+    return 0
+  fi
 
-set_sysctl_setting() {
-  local key="$1"
-  local value="$2"
-  local conf_file="/etc/sysctl.conf"
-  local escaped
+  set_status REMNANODE IN_PROGRESS
+  ensure_docker
 
-  escaped="$(printf '%s' "$key" | sed -e 's/[.[\\*^$()+?{}|]/\\\\&/g')"
-
-  if grep -Eq "^[[:space:]]*${escaped}[[:space:]]*=" "$conf_file"; then
-    sed -i -E "s|^[[:space:]]*${escaped}[[:space:]]*=.*|${key}=${value}|" "$conf_file"
+  if [[ ! -f "$COMPOSE_FILE" ]]; then
+    info "no compose file at $COMPOSE_FILE yet, creating one"
+    local secret_key="$REMNANODE_SECRET_KEY"
+    if [[ -z "$secret_key" ]]; then
+      # stdout is redirected to tee at this point in issue_certificate, but
+      # /dev/tty is still the real terminal, so an interactive prompt works.
+      if [[ -r /dev/tty ]]; then
+        read -r -p "Paste SECRET_KEY from the Remnawave panel: " secret_key < /dev/tty || true
+      fi
+    fi
+    secret_key="$(trim "${secret_key//$'\r'/}")"
+    if [[ -z "$secret_key" ]]; then
+      set_status REMNANODE FAIL "SECRET_KEY not provided"
+      die "SECRET_KEY is required to create $COMPOSE_FILE (set REMNANODE_SECRET_KEY=... or run interactively)"
+    fi
+    write_remnanode_compose "$secret_key"
   else
-    printf '%s=%s\n' "$key" "$value" >> "$conf_file"
+    info "compose file already exists at $COMPOSE_FILE, leaving it as-is"
+  fi
+
+  ( cd "$REMNANODE_DIR" && docker compose up -d "$REMNANODE_SERVICE_NAME" )
+
+  sleep 2
+  if docker ps --format '{{.Names}}' | grep -qx "$REMNANODE_SERVICE_NAME"; then
+    set_status REMNANODE OK "container is running"
+    ok "$REMNANODE_SERVICE_NAME is up"
+  else
+    set_status REMNANODE FAIL "container did not start, check: docker compose -f $COMPOSE_FILE logs"
+    die "$REMNANODE_SERVICE_NAME did not start; check 'docker compose -f $COMPOSE_FILE logs'"
   fi
 }
 
-configure_bbr() {
-  set_sysctl_setting "net.core.default_qdisc" "fq"
-  set_sysctl_setting "net.ipv4.tcp_congestion_control" "bbr"
+# ---------------------------------------------------------------------------
+# Issue the certificate for the first time
+# ---------------------------------------------------------------------------
+issue_certificate() {
+  require_root
+  need_cmd curl
+  mkdir -p "$CERT_DIR" "$(dirname "$LOG_FILE")"
+  touch "$LOG_FILE" "$STATUS_FILE"
+  trap print_summary EXIT
 
-  sysctl -p >/tmp/remnanode-sysctl.log 2>&1 || {
-    cat /tmp/remnanode-sysctl.log >&2 || true
-    return 1
-  }
-
-  local current_cc=""
-  local current_qdisc=""
-  current_cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
-  current_qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"
-
-  [[ "$current_cc" == "bbr" ]] || return 1
-  [[ "$current_qdisc" == "fq" ]] || return 1
-
-  ok "BBR enabled: tcp_congestion_control=$current_cc, default_qdisc=$current_qdisc"
-}
-
-install_traffic_guard() {
-  export DEBIAN_FRONTEND=noninteractive
-
-  wait_for_apt_locks 900
-
-  if command -v debconf-set-selections >/dev/null 2>&1; then
-    echo iptables-persistent iptables-persistent/autosave_v4 boolean false | debconf-set-selections || true
-    echo iptables-persistent iptables-persistent/autosave_v6 boolean false | debconf-set-selections || true
-  fi
-
-  wait_for_apt_locks 900
-  apt-get update -y
-  wait_for_apt_locks 900
-  apt-get install -y curl ipset iptables iptables-persistent rsyslog cron
-
-  curl -fsSL https://raw.githubusercontent.com/dotX12/traffic-guard/master/install.sh | bash
-  [[ -x /usr/local/bin/traffic-guard ]] || die "traffic-guard binary not found at /usr/local/bin/traffic-guard"
-
-  cat > /usr/local/sbin/traffic-guard-apply.sh <<'EOF2'
-#!/usr/bin/env bash
-set -euo pipefail
-
-/usr/local/bin/traffic-guard full \
-  -u https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/main/public/antiscanner.list \
-  -u https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/main/public/government_networks.list
-
-netfilter-persistent save || true
-EOF2
-
-  chmod 755 /usr/local/sbin/traffic-guard-apply.sh
-  local apply_attempt=1
-  local max_attempts=5
-  while (( apply_attempt <= max_attempts )); do
-    wait_for_apt_locks 900
-    if /usr/local/sbin/traffic-guard-apply.sh; then
-      break
+  # Guarded: on a brand-new server docker may not exist yet at this point
+  # (it gets installed later by ensure_docker), so `docker ps` here would
+  # otherwise abort the whole script under `set -e` before certbot is even
+  # touched.
+  if command -v docker >/dev/null 2>&1; then
+    dockerpsq="$(docker ps -q || true)"
+    if [[ -n "$dockerpsq" ]]; then
+      docker stop $dockerpsq
     fi
-    if (( apply_attempt == max_attempts )); then
-      die "traffic-guard apply failed after ${max_attempts} attempts"
-    fi
-    warn "traffic-guard apply failed (attempt ${apply_attempt}/${max_attempts}), retrying in 10s..."
-    sleep 10
-    apply_attempt=$((apply_attempt + 1))
-  done
-
-  cat > /etc/cron.d/traffic-guard-update <<'EOF2'
-17 3 * * * root /usr/local/sbin/traffic-guard-apply.sh >> /var/log/traffic-guard-update.log 2>&1
-EOF2
-
-  chmod 644 /etc/cron.d/traffic-guard-update
-  systemctl enable --now cron
-
-  ok "traffic-guard installed and cron enabled (daily at 03:17)"
-}
-
-configure_ufw_smtp_protection() {
-  local ssh_port="22"
-  local ufw_out=""
-
-  if [[ -n "${SSH_CONNECTION:-}" ]]; then
-    ssh_port="$(printf '%s' "$SSH_CONNECTION" | awk '{print $4}')"
-  fi
-  if ! is_int "$ssh_port"; then
-    ssh_port="22"
+    echo "ALLCONTSTOPPED"
+  else
+    info "docker not installed yet, nothing to stop"
   fi
 
-  wait_for_apt_locks 900
-  apt-get update -y
-  wait_for_apt_locks 900
-  apt-get install -y ufw
+  # Mirror everything to the log file so the run can be followed with
+  # `tail -f /var/log/remnanode-ip-cert.log` from a second SSH session.
+  exec > >(tee -a "$LOG_FILE") 2>&1
 
-  ufw --force reset
-  ufw default deny incoming
-  ufw default allow outgoing
-  ufw allow 22/tcp
-  ufw allow "${DEFAULT_NODE_PORT}/tcp"
-  ufw allow 48765/tcp
-  if [[ "$ssh_port" != "22" ]]; then
-    ufw allow "${ssh_port}/tcp"
-    ok "added current SSH server port rule: ${ssh_port}/tcp"
+  echo "Starting at $(date -u +%FT%TZ). Follow progress from another session with:"
+  echo "  tail -f ${LOG_FILE}"
+  echo "  watch -n2 cat ${STATUS_FILE}"
+
+  step "Installing / verifying certbot (needs >= ${CERTBOT_MIN_VERSION} for IP certs)"
+  ensure_certbot
+  local certbot="$CERTBOT_BIN"
+  [[ -n "$certbot" ]] || die "internal error: ensure_certbot did not set CERTBOT_BIN"
+
+  step "Detecting public IPv4 address"
+  set_status IP IN_PROGRESS
+  if [[ -z "$NODE_IP" ]]; then
+    info "NODE_IP not set, auto-detecting public IPv4"
+    NODE_IP="$(detect_public_ip || true)"
   fi
-  ufw allow 443/tcp
-
-  ufw deny out 25/tcp || true
-  ufw route deny proto tcp to any port 25 || true
-
-  ufw --force enable
-  ufw reload
-
-  ufw_out="$(ufw status verbose || true)"
-  printf '%s\n' "$ufw_out" > /tmp/remnanode-ufw-status.log
-
-  echo "$ufw_out" | grep -q "Default: deny (incoming), allow (outgoing)" || return 1
-  echo "$ufw_out" | grep -Eq "22/tcp|OpenSSH" || return 1
-  echo "$ufw_out" | grep -q "443/tcp" || return 1
-  echo "$ufw_out" | grep -qE "25/tcp[[:space:]]+DENY OUT" || return 1
-  echo "$ufw_out" | grep -qE "25/tcp[[:space:]]+DENY FWD" || return 1
-
-  ok "ufw baseline + smtp protections applied"
-}
-
-extract_inline_certs_from_active_config() {
-  local helper_tag="$CERT_HELPER_TAG"
-  local log_file="/tmp/remnanode-inline-cert-sync.log"
-  local container_ssl_dir="/var/lib/remnawave/configs/xray/ssl"
-
-  if ! docker ps --format '{{.Names}}' | grep -qx "$REMNANODE_SERVICE_NAME"; then
-    warn "container ${REMNANODE_SERVICE_NAME} is not running yet"
-    return 1
+  if ! is_ipv4 "$NODE_IP"; then
+    set_status IP FAIL "could not auto-detect a valid IPv4"
+    die "could not determine a valid public IPv4 address (set NODE_IP=1.2.3.4 explicitly)"
   fi
+  set_status IP OK "$NODE_IP"
+  ok "using IP address: $NODE_IP"
 
-  if docker exec -i \
-    -e CERT_TAG="$helper_tag" \
-    -e CERT_TAG_STRICT="$CERT_HELPER_TAG_STRICT" \
-    "$REMNANODE_SERVICE_NAME" sh >"$log_file" 2>&1 <<'EOSH'
-set -eu
+  step "Checking that port ${HTTP01_PORT} is free for the HTTP-01 challenge"
+  ensure_port80_free
+  write_deploy_hook_script
 
-SOCK="$(tr '\0' '\n' </proc/1/environ | sed -n 's/^INTERNAL_SOCKET_PATH=//p' | head -n1)"
-TOK="$(tr '\0' '\n' </proc/1/environ | sed -n 's/^INTERNAL_REST_TOKEN=//p' | head -n1)"
-[ -n "$SOCK" ] && [ -n "$TOK" ] || { echo "NO_RUNTIME_ENV"; exit 11; }
-
-SOCK="$SOCK" TOK="$TOK" CERT_TAG="${CERT_TAG:-}" node <<'NODE'
-const fs = require('fs');
-const http = require('http');
-
-const socketPath = process.env.SOCK;
-const token = process.env.TOK;
-const certTag = (process.env.CERT_TAG || '').trim();
-const certTagStrict = (process.env.CERT_TAG_STRICT || '').trim() === '1';
-const outDir = '/var/lib/remnawave/configs/xray/ssl';
-
-function fail(msg, code) {
-  console.error(msg);
-  process.exit(code);
-}
-
-function getCertObj(ib) {
-  return ib?.streamSettings?.tlsSettings?.certificates?.[0] || null;
-}
-
-function hasInlineCert(ib) {
-  const c = getCertObj(ib);
-  return Array.isArray(c?.certificate) &&
-    c.certificate.length > 0 &&
-    Array.isArray(c?.key) &&
-    c.key.length > 0;
-}
-
-function hasFileRefCert(ib) {
-  const c = getCertObj(ib);
-  return typeof c?.certificateFile === 'string' &&
-    c.certificateFile.trim().length > 0 &&
-    typeof c?.keyFile === 'string' &&
-    c.keyFile.trim().length > 0;
-}
-
-function isApiInbound(ib) {
-  const tag = String(ib?.tag || '').toUpperCase();
-  return tag === 'REMNAWAVE_API_INBOUND' || tag.includes('API_INBOUND');
-}
-
-http.get({ socketPath, path: `/internal/get-config?token=${token}` }, (res) => {
-  let raw = '';
-  res.on('data', (chunk) => {
-    raw += chunk;
-  });
-  res.on('end', () => {
-    let cfg;
-    try {
-      cfg = JSON.parse(raw || '{}');
-    } catch {
-      fail('BAD_CONFIG_JSON', 12);
-    }
-
-    const inbounds = Array.isArray(cfg?.inbounds) ? cfg.inbounds : [];
-
-    const fileRefInbounds = inbounds.filter((ib) => hasFileRefCert(ib));
-    const inlineInbounds = inbounds.filter((ib) => hasInlineCert(ib));
-    if (fileRefInbounds.length === 0 && inlineInbounds.length === 0) {
-      fail('NO_CERTS_IN_ACTIVE_CONFIG', 13);
-    }
-
-    let inbound = null;
-    if (certTag) {
-      inbound = fileRefInbounds.find((ib) => ib?.tag === certTag) ||
-        inlineInbounds.find((ib) => ib?.tag === certTag) ||
-        null;
-      if (!inbound && certTagStrict) {
-        const fileTags = fileRefInbounds.map((ib) => ib?.tag || '<no-tag>');
-        const inlineTags = inlineInbounds.map((ib) => ib?.tag || '<no-tag>');
-        fail(`NO_CERTS_FOR_TAG:${certTag};FILE_TAGS:${fileTags.join(',')};INLINE_TAGS:${inlineTags.join(',')}`, 13);
-      }
-    }
-    if (!inbound) {
-      const preferredFileRefs = fileRefInbounds.filter((ib) => !isApiInbound(ib));
-      const preferredInline = inlineInbounds.filter((ib) => !isApiInbound(ib));
-      inbound = preferredFileRefs[0] || preferredInline[0] || fileRefInbounds[0] || inlineInbounds[0];
-    }
-
-    const certObj = getCertObj(inbound);
-    if (!certObj) {
-      fail(`NO_CERT_OBJ_FOR_TAG:${inbound?.tag || '<no-tag>'}`, 14);
-    }
-
-    let certPem = '';
-    let keyPem = '';
-    let source = '';
-
-    if (hasFileRefCert(inbound)) {
-      source = 'file_refs';
-      const certFile = certObj.certificateFile.trim();
-      const keyFile = certObj.keyFile.trim();
-      try {
-        certPem = fs.readFileSync(certFile, 'utf8');
-        keyPem = fs.readFileSync(keyFile, 'utf8');
-      } catch (err) {
-        fail(`CERT_FILE_READ_ERROR:${err.message};CERT_FILE:${certFile};KEY_FILE:${keyFile}`, 15);
-      }
-      if (!certPem.trim() || !keyPem.trim()) {
-        fail(`CERT_FILE_EMPTY;CERT_FILE:${certFile};KEY_FILE:${keyFile}`, 16);
-      }
-      if (!certPem.endsWith('\n')) certPem += '\n';
-      if (!keyPem.endsWith('\n')) keyPem += '\n';
-    } else if (hasInlineCert(inbound)) {
-      source = 'inline_pem';
-      certPem = `${certObj.certificate.join('\n')}\n`;
-      keyPem = `${certObj.key.join('\n')}\n`;
-    } else {
-      fail(`NO_USABLE_CERT_DATA_FOR_TAG:${inbound?.tag || '<no-tag>'}`, 17);
-    }
-
-    fs.mkdirSync(outDir, { recursive: true });
-    fs.writeFileSync(`${outDir}/fullchain.pem`, certPem, { mode: 0o644 });
-    fs.writeFileSync(`${outDir}/privkey.pem`, keyPem, { mode: 0o600 });
-
-    try { fs.unlinkSync(`${outDir}/privkey.key`); } catch {}
-    try {
-      fs.symlinkSync(`${outDir}/privkey.pem`, `${outDir}/privkey.key`);
-    } catch {
-      fs.writeFileSync(`${outDir}/privkey.key`, keyPem, { mode: 0o600 });
-    }
-
-    const fileTags = fileRefInbounds.map((ib) => ib?.tag || '<no-tag>');
-    const inlineTags = inlineInbounds.map((ib) => ib?.tag || '<no-tag>');
-    console.log(`EXTRACTED_FROM_TAG=${inbound.tag || '<no-tag>'};SOURCE=${source};FILE_TAGS=${fileTags.join(',')};INLINE_TAGS=${inlineTags.join(',')}`);
-  });
-}).on('error', (err) => {
-  fail(`REQUEST_ERROR:${err.message}`, 14);
-});
-NODE
-EOSH
-  then
-    mkdir -p "$CERT_DIR"
-
-    if ! docker cp "${REMNANODE_SERVICE_NAME}:${container_ssl_dir}/fullchain.pem" "$DEFAULT_CERT_FILE" 2>/dev/null; then
-      warn "runtime cert sync: failed to copy fullchain.pem from container"
-      return 1
-    fi
-
-    if ! docker cp "${REMNANODE_SERVICE_NAME}:${container_ssl_dir}/privkey.pem" "$DEFAULT_KEY_PEM" 2>/dev/null; then
-      warn "runtime cert sync: failed to copy privkey.pem from container"
-      return 1
-    fi
-
-    chmod 644 "$DEFAULT_CERT_FILE" 2>/dev/null || true
-    chmod 600 "$DEFAULT_KEY_PEM" 2>/dev/null || true
-    ln -sfn "$DEFAULT_KEY_PEM" "$DEFAULT_KEY_KEY" || true
-
-    if [[ -s "$DEFAULT_CERT_FILE" && ( -s "$DEFAULT_KEY_PEM" || -s "$DEFAULT_KEY_KEY" ) ]]; then
-      ok "runtime certificates synced into ${CERT_DIR}"
-      return 0
-    fi
-
-    warn "runtime cert sync: host certificate files are still missing in ${CERT_DIR}"
-    return 1
+  step "Requesting the IP certificate from Let's Encrypt (profile: shortlived, ~160h validity)"
+  set_status ISSUE IN_PROGRESS
+  local -a args=(
+    certonly --standalone --non-interactive --agree-tos
+    --preferred-profile shortlived
+    --http-01-port "$HTTP01_PORT"
+    --ip-address "$NODE_IP"
+    --cert-name "$NODE_IP"
+    --deploy-hook "$DEPLOY_HOOK"
+  )
+  if [[ -n "$LE_EMAIL" ]]; then
+    args+=(-m "$LE_EMAIL")
+  else
+    warn "LE_EMAIL not set; using --register-unsafely-without-email (you will not get expiry/ARI notices from Let's Encrypt)"
+    args+=(--register-unsafely-without-email)
+  fi
+  if [[ "$CERTBOT_STAGING" == "1" ]]; then
+    warn "issuing a STAGING (untrusted) certificate because CERTBOT_STAGING=1"
+    args+=(--staging)
   fi
 
-  warn "runtime cert sync failed ($(tail -n 1 "$log_file" 2>/dev/null || echo unknown))"
-  return 1
-}
-
-wait_for_node_certificates() {
-  local cert_file="$DEFAULT_CERT_FILE"
-  local key_file="$DEFAULT_KEY_PEM"
-  local waited=0
-
-  mkdir -p "$CERT_DIR"
-
-  if [[ -s "$DEFAULT_KEY_PEM" && ! -e "$DEFAULT_KEY_KEY" ]]; then
-    ln -sfn "$DEFAULT_KEY_PEM" "$DEFAULT_KEY_KEY" || true
+  if ! "$certbot" "${args[@]}"; then
+    set_status ISSUE FAIL "certonly failed, see /var/log/letsencrypt/letsencrypt.log"
+    die "certbot certonly failed, see /var/log/letsencrypt/letsencrypt.log"
   fi
+  set_status ISSUE OK "certificate obtained for $NODE_IP"
 
-  if [[ -s "$DEFAULT_KEY_KEY" ]]; then
-    key_file="$DEFAULT_KEY_KEY"
+  step "Deploying the certificate into ${CERT_DIR} and restarting containers"
+  set_status DEPLOY IN_PROGRESS
+  # --deploy-hook only fires on *renewal*, so run it once manually now to
+  # populate $CERT_DIR with the certificate we just issued.
+  if ! "$DEPLOY_HOOK" "/etc/letsencrypt/live/${NODE_IP}"; then
+    set_status DEPLOY FAIL "deploy hook returned non-zero"
+    die "initial deploy step failed"
   fi
+  set_status DEPLOY OK "installed into ${CERT_DIR}"
 
-  while [[ $waited -lt $CERT_WAIT_SECONDS ]]; do
-    if [[ -s "$cert_file" && -s "$key_file" ]]; then
-      ok "certificates detected in $CERT_DIR"
-      return 0
-    fi
+  step "Making sure the RemnaNode container is up"
+  ensure_remnanode_running
 
-    if (( waited % 10 == 0 )); then
-      extract_inline_certs_from_active_config || true
-      if [[ -s "$cert_file" && -s "$key_file" ]]; then
-        ok "certificates extracted from active node config"
-        return 0
-      fi
-    fi
+  step "Installing the systemd renewal timer"
+  set_status TIMER IN_PROGRESS
+  install_renew_timer
+  set_status TIMER OK "${RENEW_ON_CALENDAR} (+${RENEW_RANDOMIZED_DELAY_SECONDS}s)"
 
-    if [[ $waited -eq 0 ]]; then
-      warn "certificates are not present yet"
-      echo "Do this in panel now:"
-      echo "1) Nodes -> Management -> open your node and finish creation"
-      echo "2) Push/apply profile and restart Xray on node"
-      echo "3) Ensure at least one Active Inbound has tlsSettings.certificates with certificateFile/keyFile paths"
-      if [[ -n "$CERT_HELPER_TAG" ]]; then
-        echo "4) Preferred cert tag is '${CERT_HELPER_TAG}' (set CERT_HELPER_TAG= to auto-pick first available cert source)"
-      fi
-      echo
-      echo "Waiting up to ${CERT_WAIT_SECONDS}s for certs in $CERT_DIR ..."
-    fi
-
-    sleep 5
-    waited=$((waited + 5))
-    if [[ -s "$DEFAULT_KEY_KEY" ]]; then
-      key_file="$DEFAULT_KEY_KEY"
-    fi
-  done
-
-  warn "certificates were not detected automatically"
-  return 1
+  echo
+  ok "IP certificate issued and installed"
+  echo "  cert: $DEFAULT_CERT_FILE"
+  echo "  key:  $DEFAULT_KEY_KEY (real file copy, installed by deploy hook on every issue/renew)"
+  echo
+  echo "Panel / Xray inbound TLS settings should point to:"
+  echo "  certificates[0].certificateFile: \"/var/lib/remnawave/configs/xray/ssl/fullchain.pem\""
+  echo "  certificates[0].keyFile:         \"/var/lib/remnawave/configs/xray/ssl/privkey.key\""
+  echo
+  echo "Certificate is short-lived (~6.6 days). A systemd timer will attempt renewal"
+  echo "every 6h and Let's Encrypt/certbot will actually renew it once ~half its"
+  echo "lifetime remains, then restart ${REMNANODE_SERVICE_NAME} automatically."
 }
 
-pick_key_file() {
-  if [[ -s "$DEFAULT_KEY_KEY" ]]; then
-    printf '%s' "$DEFAULT_KEY_KEY"
-    return 0
-  fi
-  if [[ -s "$DEFAULT_KEY_PEM" ]]; then
-    printf '%s' "$DEFAULT_KEY_PEM"
-    return 0
-  fi
-  return 1
-}
+# ---------------------------------------------------------------------------
+# systemd timer for periodic renewal checks
+# ---------------------------------------------------------------------------
+install_renew_timer() {
+  require_root
+  local certbot
+  certbot="$(certbot_bin)"
+  [[ -n "$certbot" ]] || die "certbot not installed yet; run 'issue' first"
+  [[ -n "$NODE_IP" ]] || die "NODE_IP is required to scope the renewal timer"
 
-hostname_matches_pattern() {
-  local host="${1,,}"
-  local pattern="${2,,}"
-  local suffix=""
-  local prefix=""
-
-  if [[ -z "$host" || -z "$pattern" ]]; then
-    return 1
-  fi
-
-  if [[ "$host" == "$pattern" ]]; then
-    return 0
-  fi
-
-  if [[ "$pattern" == \*.* ]]; then
-    suffix="${pattern#*.}"
-    if [[ "$host" == *".${suffix}" ]]; then
-      prefix="${host%.${suffix}}"
-      [[ "$prefix" != *.* ]] && return 0
-    fi
-  fi
-
-  return 1
-}
-
-cert_matches_domain() {
-  local cert_file="$1"
-  local domain="$2"
-  local san_raw=""
-  local san_entries=""
-  local dns_name=""
-  local cn=""
-
-  [[ -s "$cert_file" ]] || return 1
-
-  san_raw="$(openssl x509 -in "$cert_file" -noout -ext subjectAltName 2>/dev/null || true)"
-  san_entries="$(printf '%s\n' "$san_raw" | grep -oE 'DNS:[^, ]+' | sed 's/^DNS://')"
-  if [[ -n "$san_entries" ]]; then
-    while IFS= read -r dns_name; do
-      dns_name="$(trim "$dns_name")"
-      if hostname_matches_pattern "$domain" "$dns_name"; then
-        return 0
-      fi
-    done <<< "$san_entries"
-    return 1
-  fi
-
-  cn="$(openssl x509 -in "$cert_file" -noout -subject 2>/dev/null | sed -n 's/.*CN[[:space:]]*=[[:space:]]*//p' | head -n1)"
-  cn="$(trim "$cn")"
-  hostname_matches_pattern "$domain" "$cn"
-}
-
-show_cert_brief() {
-  local cert_file="$1"
-  openssl x509 -in "$cert_file" -noout -subject -issuer -dates -ext subjectAltName 2>/dev/null || true
-}
-
-cert_contains_dns_pattern() {
-  local cert_file="$1"
-  local required_pattern="${2,,}"
-  local san_raw=""
-  local san_entries=""
-  local dns_name=""
-  local cn=""
-
-  [[ -s "$cert_file" ]] || return 1
-  [[ -n "$required_pattern" ]] || return 0
-
-  san_raw="$(openssl x509 -in "$cert_file" -noout -ext subjectAltName 2>/dev/null || true)"
-  san_entries="$(printf '%s\n' "$san_raw" | grep -oE 'DNS:[^, ]+' | sed 's/^DNS://')"
-  if [[ -n "$san_entries" ]]; then
-    while IFS= read -r dns_name; do
-      dns_name="$(trim "$dns_name")"
-      [[ "${dns_name,,}" == "$required_pattern" ]] && return 0
-    done <<< "$san_entries"
-  fi
-
-  cn="$(openssl x509 -in "$cert_file" -noout -subject 2>/dev/null | sed -n 's/.*CN[[:space:]]*=[[:space:]]*//p' | head -n1)"
-  cn="$(trim "$cn")"
-  [[ "${cn,,}" == "$required_pattern" ]]
-}
-
-install_selfsteal_cert_sync() {
-  local sync_script="/usr/local/bin/remnanode-selfsteal-cert-sync"
-  local service_file="/etc/systemd/system/remnanode-selfsteal-cert-sync.service"
-  local timer_file="/etc/systemd/system/remnanode-selfsteal-cert-sync.timer"
-
-  if [[ "${CERT_SYNC_ENABLED:-1}" != "1" ]]; then
-    warn "selfsteal cert sync is disabled (CERT_SYNC_ENABLED=${CERT_SYNC_ENABLED})"
-    return 0
-  fi
-
-  cat > "$sync_script" <<'SYNC_SCRIPT'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-
-REMNANODE_SERVICE_NAME="${REMNANODE_SERVICE_NAME:-__REMNANODE_SERVICE_NAME__}"
-SELFSTEAL_NGINX_SERVICE_NAME="${SELFSTEAL_NGINX_SERVICE_NAME:-__SELFSTEAL_NGINX_SERVICE_NAME__}"
-SELFSTEAL_BASE_DOMAIN="${SELFSTEAL_BASE_DOMAIN:-__SELFSTEAL_BASE_DOMAIN__}"
-CERT_HELPER_TAG="${CERT_HELPER_TAG:-__CERT_HELPER_TAG__}"
-CERT_HELPER_TAG_STRICT="${CERT_HELPER_TAG_STRICT:-__CERT_HELPER_TAG_STRICT__}"
-REMNANODE_CERT_DIR="${REMNANODE_CERT_DIR:-__REMNANODE_CERT_DIR__}"
-SELFSTEAL_NGINX_SSL_DIR="${SELFSTEAL_NGINX_SSL_DIR:-__SELFSTEAL_NGINX_SSL_DIR__}"
-LOCK_FILE="\${LOCK_FILE:-/run/remnanode-selfsteal-cert-sync.lock}"
-
-log() { echo "[cert-sync] \$*"; }
-warn() { echo "[cert-sync] WARN: \$*" >&2; }
-die() { echo "[cert-sync] FAIL: \$*" >&2; exit 1; }
-
-fingerprint() {
-  local cert_file="\$1"
-  [[ -s "\$cert_file" ]] || return 1
-  openssl x509 -in "\$cert_file" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2
-}
-
-command -v docker >/dev/null 2>&1 || die "docker is required"
-command -v openssl >/dev/null 2>&1 || die "openssl is required"
-command -v flock >/dev/null 2>&1 || die "flock is required"
-
-exec 9>"\$LOCK_FILE"
-flock -n 9 || { log "another sync is running"; exit 0; }
-
-tmp_dir="\$(mktemp -d)"
-trap 'rm -rf "\$tmp_dir"' EXIT
-
-docker ps --format '{{.Names}}' | grep -qx "\$REMNANODE_SERVICE_NAME" || die "container \$REMNANODE_SERVICE_NAME is not running"
-
-docker exec -i \
-  -e BASE_DOMAIN="\$SELFSTEAL_BASE_DOMAIN" \
-  -e CERT_TAG="\$CERT_HELPER_TAG" \
-  -e CERT_TAG_STRICT="\$CERT_HELPER_TAG_STRICT" \
-  "\$REMNANODE_SERVICE_NAME" sh <<'EOSH'
-set -eu
-
-SOCK="$(tr '\0' '\n' </proc/1/environ | sed -n 's/^INTERNAL_SOCKET_PATH=//p' | head -n1)"
-TOK="$(tr '\0' '\n' </proc/1/environ | sed -n 's/^INTERNAL_REST_TOKEN=//p' | head -n1)"
-[ -n "$SOCK" ] && [ -n "$TOK" ] || { echo "NO_RUNTIME_ENV" >&2; exit 11; }
-
-SOCK="$SOCK" TOK="$TOK" BASE_DOMAIN="${BASE_DOMAIN:-}" CERT_TAG="${CERT_TAG:-}" CERT_TAG_STRICT="${CERT_TAG_STRICT:-0}" node <<'NODE'
-const fs = require('fs');
-const http = require('http');
-
-const socketPath = process.env.SOCK;
-const token = process.env.TOK;
-const baseDomain = (process.env.BASE_DOMAIN || '').trim().toLowerCase().replace(/^\./, '');
-const certTag = (process.env.CERT_TAG || '').trim();
-const certTagStrict = (process.env.CERT_TAG_STRICT || '').trim() === '1';
-
-function fail(message, code) {
-  console.error(message);
-  process.exit(code);
-}
-
-function getCertObj(ib) {
-  return ib?.streamSettings?.tlsSettings?.certificates?.[0] || null;
-}
-
-function hasInlineCert(ib) {
-  const c = getCertObj(ib);
-  return Array.isArray(c?.certificate) && c.certificate.length > 0 &&
-    Array.isArray(c?.key) && c.key.length > 0;
-}
-
-function hasFileRefCert(ib) {
-  const c = getCertObj(ib);
-  return typeof c?.certificateFile === 'string' && c.certificateFile.trim().length > 0 &&
-    typeof c?.keyFile === 'string' && c.keyFile.trim().length > 0;
-}
-
-function isApiInbound(ib) {
-  const tag = String(ib?.tag || '').toUpperCase();
-  return tag === 'REMNAWAVE_API_INBOUND' || tag.includes('API_INBOUND');
-}
-
-function baseDomainMatch(name) {
-  const lower = String(name || '').trim().toLowerCase();
-  return baseDomain && (lower === baseDomain || lower.endsWith(`.${baseDomain}`));
-}
-
-function scoreInbound(ib, order) {
-  if (!hasInlineCert(ib) && !hasFileRefCert(ib)) return -1;
-  if (isApiInbound(ib)) return -1;
-  if (certTagStrict && certTag && ib?.tag !== certTag) return -1;
-
-  const tag = String(ib?.tag || '').toLowerCase();
-  const names = Array.isArray(ib?.streamSettings?.realitySettings?.serverNames)
-    ? ib.streamSettings.realitySettings.serverNames
-    : [];
-
-  let score = 0;
-  if (certTag && ib?.tag === certTag) score += 10000;
-  if (tag.includes('selfsteal') || tag.includes('selfstealer')) score += 1000;
-  if (Number(ib?.port) === 443) score += 500;
-  if (names.some(baseDomainMatch)) score += 300;
-  if (hasFileRefCert(ib)) score += 20;
-  if (hasInlineCert(ib)) score += 10;
-  return score * 100000 - order;
-}
-
-http.get({ socketPath, path: `/internal/get-config?token=${encodeURIComponent(token)}` }, (res) => {
-  let raw = '';
-  res.on('data', (chunk) => {
-    raw += chunk;
-  });
-  res.on('end', () => {
-    let cfg;
-    try {
-      cfg = JSON.parse(raw || '{}');
-    } catch {
-      fail(`BAD_CONFIG_JSON:${raw.slice(0, 80).replace(/\n/g, ' ')}`, 12);
-    }
-
-    const inbounds = Array.isArray(cfg?.inbounds) ? cfg.inbounds : [];
-    const candidates = inbounds
-      .map((ib, order) => ({ ib, score: scoreInbound(ib, order) }))
-      .filter((candidate) => candidate.score >= 0)
-      .sort((a, b) => b.score - a.score);
-
-    if (candidates.length === 0) {
-      fail('NO_SELFSTEAL_CERT_IN_ACTIVE_CONFIG', 13);
-    }
-
-    const inbound = candidates[0].ib;
-    const certObj = getCertObj(inbound);
-    let certPem = '';
-    let keyPem = '';
-    let source = '';
-
-    if (hasFileRefCert(inbound)) {
-      source = 'file_refs';
-      const certFile = certObj.certificateFile.trim();
-      const keyFile = certObj.keyFile.trim();
-      try {
-        certPem = fs.readFileSync(certFile, 'utf8');
-        keyPem = fs.readFileSync(keyFile, 'utf8');
-      } catch (err) {
-        fail(`CERT_FILE_READ_ERROR:${err.message};CERT_FILE:${certFile};KEY_FILE:${keyFile}`, 14);
-      }
-    } else if (hasInlineCert(inbound)) {
-      source = 'inline_pem';
-      certPem = `${certObj.certificate.join('\n')}\n`;
-      keyPem = `${certObj.key.join('\n')}\n`;
-    } else {
-      fail(`NO_USABLE_CERT_DATA_FOR_TAG:${inbound?.tag || '<no-tag>'}`, 15);
-    }
-
-    fs.writeFileSync('/tmp/remnanode-selfsteal-fullchain.pem', certPem.endsWith('\n') ? certPem : `${certPem}\n`, { mode: 0o644 });
-    fs.writeFileSync('/tmp/remnanode-selfsteal-privkey.pem', keyPem.endsWith('\n') ? keyPem : `${keyPem}\n`, { mode: 0o600 });
-    fs.writeFileSync('/tmp/remnanode-selfsteal-source.txt', `tag=${inbound?.tag || '<no-tag>'};source=${source}\n`, { mode: 0o644 });
-  });
-}).on('error', (err) => {
-  fail(`REQUEST_ERROR:${err.message}`, 16);
-});
-NODE
-EOSH
-
-docker cp "\$REMNANODE_SERVICE_NAME:/tmp/remnanode-selfsteal-fullchain.pem" "\$tmp_dir/fullchain.pem" >/dev/null
-docker cp "\$REMNANODE_SERVICE_NAME:/tmp/remnanode-selfsteal-privkey.pem" "\$tmp_dir/privkey.pem" >/dev/null
-docker cp "\$REMNANODE_SERVICE_NAME:/tmp/remnanode-selfsteal-source.txt" "\$tmp_dir/source.txt" >/dev/null 2>&1 || true
-
-incoming_fp="\$(fingerprint "\$tmp_dir/fullchain.pem")" || die "incoming certificate is invalid"
-current_nginx_fp=""
-current_remnanode_fp=""
-if [[ -s "\$SELFSTEAL_NGINX_SSL_DIR/fullchain.crt" ]]; then
-  current_nginx_fp="\$(fingerprint "\$SELFSTEAL_NGINX_SSL_DIR/fullchain.crt" || true)"
-fi
-if [[ -s "\$REMNANODE_CERT_DIR/fullchain.pem" ]]; then
-  current_remnanode_fp="\$(fingerprint "\$REMNANODE_CERT_DIR/fullchain.pem" || true)"
-fi
-
-reload_nginx=0
-if [[ "\$incoming_fp" != "\$current_nginx_fp" ]]; then
-  reload_nginx=1
-fi
-
-if [[ -n "\$current_nginx_fp" && "\$incoming_fp" == "\$current_nginx_fp" && "\$incoming_fp" == "\$current_remnanode_fp" ]]; then
-  log "certificate unchanged: \$incoming_fp"
-  exit 0
-fi
-
-log "certificate sync needed: nginx=\${current_nginx_fp:-none}, remnanode=\${current_remnanode_fp:-none}, incoming=\$incoming_fp"
-if [[ -s "\$tmp_dir/source.txt" ]]; then
-  log "\$(cat "\$tmp_dir/source.txt")"
-fi
-
-stamp="\$(date -u +%Y%m%dT%H%M%SZ)"
-if [[ -d "\$SELFSTEAL_NGINX_SSL_DIR" ]]; then
-  cp -a "\$SELFSTEAL_NGINX_SSL_DIR" "\$SELFSTEAL_NGINX_SSL_DIR.backup.\$stamp"
-fi
-if [[ -d "\$REMNANODE_CERT_DIR" ]]; then
-  cp -a "\$REMNANODE_CERT_DIR" "\$REMNANODE_CERT_DIR.backup.\$stamp"
-fi
-
-mkdir -p "\$SELFSTEAL_NGINX_SSL_DIR" "\$REMNANODE_CERT_DIR"
-install -m 0644 "\$tmp_dir/fullchain.pem" "\$SELFSTEAL_NGINX_SSL_DIR/fullchain.crt"
-install -m 0600 "\$tmp_dir/privkey.pem" "\$SELFSTEAL_NGINX_SSL_DIR/private.key"
-install -m 0644 "\$tmp_dir/fullchain.pem" "\$REMNANODE_CERT_DIR/fullchain.pem"
-install -m 0600 "\$tmp_dir/privkey.pem" "\$REMNANODE_CERT_DIR/privkey.pem"
-ln -sfn "\$REMNANODE_CERT_DIR/privkey.pem" "\$REMNANODE_CERT_DIR/privkey.key"
-
-docker ps --format '{{.Names}}' | grep -qx "\$SELFSTEAL_NGINX_SERVICE_NAME" || die "container \$SELFSTEAL_NGINX_SERVICE_NAME is not running"
-docker exec "\$SELFSTEAL_NGINX_SERVICE_NAME" nginx -t
-if [[ "\$reload_nginx" == "1" ]]; then
-  docker exec "\$SELFSTEAL_NGINX_SERVICE_NAME" nginx -s reload
-  log "nginx reloaded with certificate: \$incoming_fp"
-else
-  log "nginx certificate already current; files synced without reload: \$incoming_fp"
-fi
-SYNC_SCRIPT
-
-  local esc_remnanode_service=""
-  local esc_selfsteal_service=""
-  local esc_base_domain=""
-  local esc_cert_helper_tag=""
-  local esc_cert_helper_tag_strict=""
-  local esc_cert_dir=""
-  local esc_nginx_ssl_dir=""
-
-  esc_remnanode_service="$(printf '%s' "$REMNANODE_SERVICE_NAME" | sed -e 's/[\\&|]/\\&/g')"
-  esc_selfsteal_service="$(printf '%s' "$SELFSTEAL_NGINX_SERVICE_NAME" | sed -e 's/[\\&|]/\\&/g')"
-  esc_base_domain="$(printf '%s' "$SELFSTEAL_BASE_DOMAIN" | sed -e 's/[\\&|]/\\&/g')"
-  esc_cert_helper_tag="$(printf '%s' "$CERT_HELPER_TAG" | sed -e 's/[\\&|]/\\&/g')"
-  esc_cert_helper_tag_strict="$(printf '%s' "$CERT_HELPER_TAG_STRICT" | sed -e 's/[\\&|]/\\&/g')"
-  esc_cert_dir="$(printf '%s' "$CERT_DIR" | sed -e 's/[\\&|]/\\&/g')"
-  esc_nginx_ssl_dir="$(printf '%s' "$SELFSTEAL_NGINX_SSL_DIR" | sed -e 's/[\\&|]/\\&/g')"
-
-  sed -i \
-    -e 's/\\\$/$/g' \
-    -e "s|__REMNANODE_SERVICE_NAME__|$esc_remnanode_service|g" \
-    -e "s|__SELFSTEAL_NGINX_SERVICE_NAME__|$esc_selfsteal_service|g" \
-    -e "s|__SELFSTEAL_BASE_DOMAIN__|$esc_base_domain|g" \
-    -e "s|__CERT_HELPER_TAG__|$esc_cert_helper_tag|g" \
-    -e "s|__CERT_HELPER_TAG_STRICT__|$esc_cert_helper_tag_strict|g" \
-    -e "s|__REMNANODE_CERT_DIR__|$esc_cert_dir|g" \
-    -e "s|__SELFSTEAL_NGINX_SSL_DIR__|$esc_nginx_ssl_dir|g" \
-    "$sync_script"
-
-  chmod 0755 "$sync_script"
-
-  cat > "$service_file" <<EOF2
+  cat > "$SERVICE_FILE" <<EOF2
 [Unit]
-Description=Sync selfsteal TLS certificate from RemnaNode active config
-After=docker.service
+Description=Renew RemnaNode Let's Encrypt IP certificate (${NODE_IP})
+After=network-online.target docker.service
+Wants=network-online.target
 Requires=docker.service
 
 [Service]
 Type=oneshot
-ExecStart=$sync_script
+ExecStart=$0 renew
+Environment=NODE_IP=${NODE_IP}
+Environment=REMNANODE_DIR=${REMNANODE_DIR}
+Environment=REMNANODE_SERVICE_NAME=${REMNANODE_SERVICE_NAME}
+Environment=SELFSTEAL_NGINX_SERVICE_NAME=${SELFSTEAL_NGINX_SERVICE_NAME}
+Environment=SELFSTEAL_NGINX_SSL_DIR=${SELFSTEAL_NGINX_SSL_DIR}
+Environment=CERT_DIR=${CERT_DIR}
+Environment=COMPOSE_FILE=${COMPOSE_FILE}
+Environment=RESTART_ON_RENEW=${RESTART_ON_RENEW}
+Environment=HTTP01_PORT=${HTTP01_PORT}
 EOF2
 
-  cat > "$timer_file" <<EOF2
+  cat > "$TIMER_FILE" <<EOF2
 [Unit]
-Description=Daily selfsteal TLS certificate sync
+Description=Periodic check/renewal of RemnaNode IP certificate (${NODE_IP})
 
 [Timer]
-OnCalendar=${CERT_SYNC_ON_CALENDAR}
-RandomizedDelaySec=${CERT_SYNC_RANDOMIZED_DELAY_SECONDS}
+OnCalendar=${RENEW_ON_CALENDAR}
+RandomizedDelaySec=${RENEW_RANDOMIZED_DELAY_SECONDS}
 Persistent=true
 
 [Install]
 WantedBy=timers.target
 EOF2
 
+  chmod 0644 "$SERVICE_FILE" "$TIMER_FILE"
   systemctl daemon-reload
-  if [[ "${CERT_SYNC_TIMER_ENABLED:-1}" == "1" ]]; then
-    systemctl enable --now remnanode-selfsteal-cert-sync.timer
-    ok "selfsteal cert sync timer enabled: ${CERT_SYNC_ON_CALENDAR} (+${CERT_SYNC_RANDOMIZED_DELAY_SECONDS}s random delay)"
-  else
-    systemctl disable --now remnanode-selfsteal-cert-sync.timer >/dev/null 2>&1 || true
-    ok "selfsteal cert sync script installed: $sync_script"
+  systemctl enable --now remnanode-ip-cert-renew.timer
+  ok "renewal timer enabled: ${RENEW_ON_CALENDAR} (+${RENEW_RANDOMIZED_DELAY_SECONDS}s random delay)"
+}
+
+# ---------------------------------------------------------------------------
+# Called by the timer: only actually renews (and deploys) when due
+# ---------------------------------------------------------------------------
+renew_certificate() {
+  require_root
+  mkdir -p "$(dirname "$LOG_FILE")"
+  touch "$LOG_FILE" "$STATUS_FILE"
+  exec > >(tee -a "$LOG_FILE") 2>&1
+
+  echo "[$(date -u +%FT%TZ)] renew check starting for ${NODE_IP:-<unset>}"
+  local certbot
+  certbot="$(certbot_bin)"
+  [[ -n "$certbot" ]] || die "certbot not installed; run 'issue' first"
+  [[ -n "$NODE_IP" ]] || die "NODE_IP is required (was it set when the timer was installed?)"
+
+  ensure_port80_free
+
+  local -a args=(renew --cert-name "$NODE_IP" --http-01-port "$HTTP01_PORT" --quiet)
+  if [[ "$CERTBOT_STAGING" == "1" ]]; then
+    args+=(--staging)
   fi
 
-  if "$sync_script"; then
-    ok "selfsteal cert sync initial run completed"
+  if "$certbot" "${args[@]}"; then
+    set_status RENEW_LAST OK "$(date -u +%FT%TZ)"
+    ok "renew check completed for ${NODE_IP} (deploy-hook runs automatically if it actually renewed)"
   else
-    warn "selfsteal cert sync initial run failed; check journalctl -u remnanode-selfsteal-cert-sync.service"
+    set_status RENEW_LAST FAIL "$(date -u +%FT%TZ)"
+    die "certbot renew failed for ${NODE_IP}, see ${LOG_FILE}"
   fi
 }
 
-install_selfsteal() {
-  local domain="${SELFSTEAL_DOMAIN:-}"
-  local template="${SELFSTEAL_TEMPLATE:-}"
-  local port="${SELFSTEAL_PORT:-}"
-  local cert="${SELFSTEAL_SSL_CERT:-$DEFAULT_CERT_FILE}"
-  local key="${SELFSTEAL_SSL_KEY:-}"
-  local installer_file=""
-  local installer_log=""
-  local detected_domain=""
-  local prompt_value=""
-
-  domain="$(trim "$domain")"
-  template="$(trim "$template")"
-  port="$(trim "$port")"
-
-  if [[ -z "$domain" ]]; then
-    detected_domain="$(detect_selfsteal_domain_from_active_config || true)"
-    if [[ -n "$detected_domain" ]]; then
-      prompt_value="$(selfsteal_domain_prompt_value "$detected_domain")"
-      prompt_default domain "Detected serverName ${detected_domain}. Selfsteal subdomain/domain [${prompt_value}]: " "$prompt_value"
-    else
-      prompt_default domain "Selfsteal subdomain for ${SELFSTEAL_BASE_DOMAIN} [${DEFAULT_SELFSTEAL_SUBDOMAIN}]: " "$DEFAULT_SELFSTEAL_SUBDOMAIN"
-    fi
-  fi
-  domain="$(normalize_selfsteal_domain "$domain")"
-  [[ -n "$domain" ]] || die "domain is required"
-
-  if [[ -z "$template" ]]; then
-    prompt_default template "Selfsteal template 1-11 [${DEFAULT_SELFSTEAL_TEMPLATE}]: " "$DEFAULT_SELFSTEAL_TEMPLATE"
-  fi
-  is_int_1_11 "$template" || die "template must be 1..11 (got: $template)"
-
-  if [[ -z "$port" ]]; then
-    port="$DEFAULT_SELFSTEAL_PORT"
-  fi
-  is_int "$port" || die "port must be numeric (got: $port)"
-
-  if [[ -z "$key" ]]; then
-    key="$(pick_key_file || true)"
-  fi
-  [[ -n "$key" ]] || die "key file not found in $CERT_DIR"
-
-  [[ -s "$cert" ]] || die "certificate file not found or empty: $cert"
-  [[ -s "$key" ]] || die "key file not found or empty: $key"
-
-  if ! cert_matches_domain "$cert" "$domain"; then
-    warn "certificate in $cert does not match domain ${domain}; trying runtime re-sync once"
-    if [[ "$cert" == "$DEFAULT_CERT_FILE" ]]; then
-      extract_inline_certs_from_active_config || true
-      [[ -z "${SELFSTEAL_SSL_KEY:-}" ]] && key="$(pick_key_file || true)"
-    fi
-    if ! cert_matches_domain "$cert" "$domain"; then
-      echo "Current certificate details:"
-      show_cert_brief "$cert"
-      die "certificate does not cover ${domain}; update node certificate in panel and push profile"
-    fi
-    ok "certificate now matches ${domain}"
-  fi
-
-  if ! cert_contains_dns_pattern "$cert" "$CERT_REQUIRED_DNS_PATTERN"; then
-    echo "Current certificate details:"
-    show_cert_brief "$cert"
-    die "certificate must contain DNS name '${CERT_REQUIRED_DNS_PATTERN}'"
-  fi
-
-  chmod 600 "$key" 2>/dev/null || true
-
-  info "installing selfsteal with certs from remnanode mount"
-  echo "  cert: $cert"
-  echo "  key:  $key"
-  echo "  domain: $domain"
-  echo "  template: $template"
-  echo "  port: 127.0.0.1:${port}"
-
-  installer_file="$(mktemp /tmp/selfsteal-installer.XXXXXX.sh)"
-  installer_log="$(mktemp /tmp/selfsteal-install.XXXXXX.log)"
-  curl -fsSL "$SELFSTEAL_SCRIPT_URL" -o "$installer_file" || die "failed to download selfsteal installer from $SELFSTEAL_SCRIPT_URL"
-
-  if ! bash "$installer_file" @ \
-    --nginx --tcp --force \
-    --domain "$domain" \
-    --port "$port" \
-    --ssl-cert "$cert" \
-    --ssl-key "$key" \
-    --template "$template" \
-    install > >(tee "$installer_log") 2>&1; then
-    rm -f "$installer_file"
-    die "selfsteal installer failed (log: $installer_log)"
-  fi
-  rm -f "$installer_file"
-
-  if grep -Eq "System requirements not met|Docker Compose V2 is still not available" "$installer_log"; then
-    die "selfsteal installer reported unmet requirements (log: $installer_log)"
-  fi
-
-  local l9443=""
-  local wait_listen_seconds=30
-  local waited=0
-  while (( waited < wait_listen_seconds )); do
-    l9443="$(ss -H -ltnp "( sport = :${port} )" 2>/dev/null || true)"
-    if echo "$l9443" | grep -Eq 'nginx|docker-proxy'; then
-      break
-    fi
-    sleep 1
-    waited=$((waited + 1))
-  done
-  if ! echo "$l9443" | grep -Eq 'nginx|docker-proxy'; then
-    selfsteal status >/tmp/selfsteal-status-after-install.log 2>&1 || true
-    die "selfsteal endpoint 127.0.0.1:${port} is not listening after install (status: /tmp/selfsteal-status-after-install.log, installer log: $installer_log)"
-  fi
-
-  ok "selfsteal installed"
-
-  local l443=""
-  l443="$(ss -H -ltnp '( sport = :443 )' 2>/dev/null || true)"
-  if echo "$l443" | grep -q 'rw-core'; then
-    ok "port 443 is owned by rw-core"
-  else
-    warn "port 443 is not owned by rw-core; check remnanode/rw-core status"
-  fi
-
-  local code=""
-  code="$(curl -skI "https://${domain}/" --resolve "${domain}:443:127.0.0.1" --max-time 5 | awk 'NR==1{print $2; exit}' || true)"
-  if [[ "$code" == "200" ]]; then
-    ok "fallback via 443 returns HTTP 200"
-  else
-    warn "fallback via 443 returned HTTP ${code:-none}"
-  fi
-
+status() {
+  local certbot
+  certbot="$(certbot_bin || true)"
+  [[ -n "$certbot" ]] || die "certbot not installed"
+  "$certbot" certificates || true
   echo
-  echo "Use these values in panel Xray profile:"
-  echo "  realitySettings.dest: \"127.0.0.1:${port}\""
-  echo "  realitySettings.xver: 1"
-  echo "  realitySettings.serverNames: [\"${domain}\"]"
-  echo "  settings.fallbacks: [{\"dest\":\"127.0.0.1:${port}\",\"xver\":1}]"
-  echo "  certificates[0].certificateFile: \"/var/lib/remnawave/configs/xray/ssl/fullchain.pem\""
-  echo "  certificates[0].keyFile: \"/var/lib/remnawave/configs/xray/ssl/privkey.key\" (or privkey.pem)"
+  echo "-- last recorded status events (${STATUS_FILE}) --"
+  tail -n 20 "$STATUS_FILE" 2>/dev/null || echo "(no status file yet — run 'issue' first)"
+  echo
+  systemctl status remnanode-ip-cert-renew.timer --no-pager 2>/dev/null || warn "timer not installed yet"
+  systemctl list-timers 'remnanode-ip-cert-renew.timer' --no-pager 2>/dev/null || true
 }
 
 main() {
-  require_root
-  select_install_mode
-  mark_skipped_steps
+  local cmd="${1:-}"
+  case "$cmd" in
+    issue) issue_certificate ;;
+    renew) renew_certificate ;;
+    install-timer) install_renew_timer ;;
+    status) status ;;
+    *)
+      cat <<USAGE
+Usage: $0 <command>
 
-  need_cmd awk
-  need_cmd sed
-  need_cmd grep
+  issue           Install certbot (if needed), issue the IP certificate,
+                   deploy it into $CERT_DIR, and install the renewal timer.
+  renew           Run a renewal check now (this is what the timer calls).
+  install-timer   (Re)install the systemd timer only.
+  status          Show certbot certificate info + timer status.
 
-  if [[ "$RUN_NODE" -eq 1 || "$RUN_SELFSTEAL" -eq 1 || "$RUN_SCANNER" -eq 1 ]]; then
-    need_cmd curl
-  fi
-  if [[ "$RUN_SELFSTEAL" -eq 1 ]]; then
-    need_cmd ss
-  fi
+Useful env vars: NODE_IP, LE_EMAIL, CERTBOT_STAGING=1, RESTART_ON_RENEW=0,
+                 REMNANODE_DIR, REMNANODE_SERVICE_NAME, SELFSTEAL_NGINX_SERVICE_NAME,
+                 MANAGE_REMNANODE=0 (skip creating/starting the container),
+                 REMNANODE_SECRET_KEY=... (avoid the interactive prompt),
+                 SNAP_SEED_WAIT_SECONDS=60 (max wait for snapd seeding on first run).
 
-  if [[ "$RUN_NODE" -eq 1 ]]; then
-    STATUS_NODE="IN_PROGRESS"
-    install_docker_if_needed
-
-    local secret_key="${REMNANODE_SECRET_KEY:-}"
-    secret_key="$(printf '%s' "$secret_key" | tr -d '\r\n')"
-    secret_key="$(trim "$secret_key")"
-    if [[ -z "$secret_key" ]]; then
-      prompt_default secret_key "Paste SECRET_KEY from panel: " ""
-      secret_key="$(printf '%s' "$secret_key" | tr -d '\r\n')"
-      secret_key="$(trim "$secret_key")"
-    fi
-    [[ -n "$secret_key" ]] || die "SECRET_KEY is required"
-
-    write_remnanode_files "$secret_key"
-    start_remnanode
-    STATUS_NODE="OK"
-    NOTE_NODE="compose up completed"
-  fi
-
-  if [[ "$RUN_OPTIMIZATION" -eq 1 ]]; then
-    STATUS_OPTIMIZATION="IN_PROGRESS"
-    if configure_bbr; then
-      STATUS_OPTIMIZATION="OK"
-      NOTE_OPTIMIZATION="BBR enabled"
-    else
-      STATUS_OPTIMIZATION="FAIL"
-      NOTE_OPTIMIZATION="BBR configuration failed"
-      warn "BBR configuration failed"
-    fi
-  fi
-
-  if [[ "$RUN_SCANNER" -eq 1 ]]; then
-    STATUS_SCANNER="IN_PROGRESS"
-    if configure_ufw_smtp_protection && install_traffic_guard; then
-      STATUS_SCANNER="OK"
-      NOTE_SCANNER="ufw + traffic-guard active"
-    else
-      STATUS_SCANNER="FAIL"
-      NOTE_SCANNER="ufw/traffic-guard setup failed"
-      warn "ufw or traffic-guard setup failed"
-    fi
-  fi
-
-  if [[ "$RUN_SELFSTEAL" -eq 1 ]]; then
-    need_cmd docker
-    ensure_docker_compose_v2 || die "docker compose v2 is required for selfsteal install"
-
-    if [[ "$RUN_NODE" -eq 0 ]]; then
-      if ! docker ps --format '{{.Names}}' | grep -qx "$REMNANODE_SERVICE_NAME"; then
-        warn "container ${REMNANODE_SERVICE_NAME} is not running; cert extraction from runtime config may fail"
-      fi
-    fi
-
-    STATUS_SELFSTEAL="IN_PROGRESS"
-    if ! wait_for_node_certificates; then
-      STATUS_SELFSTEAL="FAIL"
-      NOTE_SELFSTEAL="certificates not received from panel yet"
-      warn "continue with selfsteal only after certs appear in $CERT_DIR"
-      echo "Re-run this script later with:"
-      echo "  REMNANODE_DIR=$REMNANODE_DIR SELFSTEAL_DOMAIN=<subdomain-or-domain> bash $0"
-      exit 2
-    fi
-
-    if install_selfsteal; then
-      install_selfsteal_cert_sync
-      STATUS_SELFSTEAL="OK"
-      NOTE_SELFSTEAL="installed, checked, cert sync timer enabled"
-    else
-      STATUS_SELFSTEAL="FAIL"
-      NOTE_SELFSTEAL="installation failed"
-      exit 2
-    fi
-  fi
-
-  if [[ "$RUN_CERT_SYNC" -eq 1 ]]; then
-    need_cmd docker
-    STATUS_SELFSTEAL="IN_PROGRESS"
-    if install_selfsteal_cert_sync; then
-      STATUS_SELFSTEAL="OK"
-      NOTE_SELFSTEAL="cert sync timer enabled"
-    else
-      STATUS_SELFSTEAL="FAIL"
-      NOTE_SELFSTEAL="cert sync timer setup failed"
-      exit 2
-    fi
-  fi
-
-  echo
-  ok "completed"
-  if [[ "$RUN_NODE" -eq 1 ]]; then
-    echo "Node compose: $COMPOSE_FILE"
-  fi
-  if [[ "$RUN_SELFSTEAL" -eq 1 || "$RUN_NODE" -eq 1 ]]; then
-    echo "Node cert dir:$CERT_DIR"
-  fi
-
-  if [[ "$STATUS_OPTIMIZATION" == "FAIL" || "$STATUS_SCANNER" == "FAIL" ]]; then
-    exit 3
-  fi
-
-  exit 0
+Track progress of a running 'issue'/'renew' from another SSH session with:
+  tail -f ${LOG_FILE}
+  watch -n2 cat ${STATUS_FILE}
+USAGE
+      exit 1
+      ;;
+  esac
 }
 
 main "$@"
