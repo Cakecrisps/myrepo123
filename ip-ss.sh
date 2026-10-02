@@ -17,6 +17,7 @@ DEFAULT_NODE_PORT="${DEFAULT_NODE_PORT:-2222}"
 SELFSTEAL_DIR="${SELFSTEAL_DIR:-/opt/nginx-selfsteal-ip}"
 SELFSTEAL_NGINX_SERVICE_NAME="${SELFSTEAL_NGINX_SERVICE_NAME:-nginx-selfsteal-ip}"
 SELFSTEAL_PORT="${SELFSTEAL_PORT:-9443}"
+SELFSTEAL_TEMPLATE="${SELFSTEAL_TEMPLATE:-random}" # 1=portfolio, 2=travel, 3=recipes
 NGINX_IMAGE="${NGINX_IMAGE:-nginx:1.28-alpine}"
 NODE_IP="${NODE_IP:-${REMNANODE_IP:-}}"
 LE_EMAIL="${LE_EMAIL:-}"
@@ -336,15 +337,88 @@ check_ports() {
   done
 }
 
+# Native static templates, with no remote fonts, scripts or tracking requests.
+# Existing content is preserved by install; change-site replaces it explicitly.
+write_site_template() {
+  local selection="${1:-$SELFSTEAL_TEMPLATE}" temporary
+  case "$selection" in
+    random) selection="$(( RANDOM % 3 + 1 ))" ;;
+    portfolio) selection=1 ;;
+    travel) selection=2 ;;
+    recipes) selection=3 ;;
+  esac
+  [[ "$selection" =~ ^[123]$ ]] || die "SELFSTEAL_TEMPLATE must be random, 1/portfolio, 2/travel, or 3/recipes"
+  mkdir -p "$SELFSTEAL_DIR/html"
+  temporary="$(mktemp "$SELFSTEAL_DIR/html/.index.XXXXXX")"
+  case "$selection" in
+    1)
+      cat > "$temporary" <<'HTML'
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="Свет и форма — коллекция графических этюдов об архитектуре, пространстве и цвете."><title>Свет и форма — графические этюды</title>
+<style>
+:root{--paper:#f3f0e9;--ink:#252b29;--muted:#727870;--accent:#9b4e33}*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--paper);color:var(--ink);font:16px/1.6 system-ui,sans-serif}a{color:inherit;text-decoration:none}header,main,footer{max-width:1280px;margin:auto;padding:0 6vw}header{display:flex;justify-content:space-between;align-items:center;height:100px;border-bottom:1px solid #252b2922}.logo{font-family:Georgia,serif;font-size:25px}nav{display:flex;gap:28px;font-size:13px}.hero{padding:76px 0 65px;display:grid;grid-template-columns:3fr 1fr;gap:40px;align-items:end}.eyebrow{font-size:11px;letter-spacing:.2em;text-transform:uppercase;color:var(--accent)}h1{font:clamp(46px,6vw,84px)/1.07 Georgia,serif;font-weight:400;letter-spacing:-.055em;margin:18px 0}.intro{color:var(--muted);font-size:14px;max-width:260px}.section-head{display:flex;justify-content:space-between;align-items:center;margin:16px 0 22px;font-size:12px}.works{display:grid;grid-template-columns:1fr 1fr;gap:32px}.work svg{display:block;width:100%;height:auto}.work:nth-child(2){padding-top:100px}.caption{display:flex;justify-content:space-between;align-items:center;padding:16px 0;font-size:13px}.caption span{color:var(--muted);font-size:11px}.about{margin:72px 0;display:grid;grid-template-columns:1fr 2fr;gap:30px;border-top:1px solid #252b2922;padding-top:38px}.about p{max-width:650px;margin:0;font:25px/1.5 Georgia,serif}.note{color:var(--muted);font-size:13px;margin-top:24px!important;font-family:system-ui!important}footer{padding-top:28px;padding-bottom:28px;border-top:1px solid #252b2922;display:flex;justify-content:space-between;font-size:11px;color:var(--muted)}a:hover{color:var(--accent)}a:focus-visible{outline:2px solid var(--accent);outline-offset:5px}@media(max-width:650px){header{height:80px}nav{gap:16px}.hero{padding:48px 0;grid-template-columns:1fr;gap:15px}.intro{max-width:100%}.works{grid-template-columns:1fr;gap:15px}.work:nth-child(2){padding-top:0}.about{grid-template-columns:1fr;margin:45px 0}.about p{font-size:22px}}@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+</style></head><body>
+<header><a class="logo" href="#">Свет и форма<span style="color:#9b4e33">.</span></a><nav aria-label="Навигация"><a href="#works">Работы</a><a href="#about">О коллекции</a></nav></header>
+<main><section class="hero"><div><div class="eyebrow">Коллекция графических этюдов</div><h1>Пространство.<br>Свет. Тишина.</h1></div><p class="intro">Небольшие наблюдения о том, как простые формы складываются в истории. Архитектура, пейзаж и немного цвета.</p></section>
+<section id="works"><div class="section-head"><span>ИЗБРАННЫЕ ЭТЮДЫ</span><span>01 — 04</span></div><div class="works">
+<article class="work"><svg viewBox="0 0 600 660" role="img" aria-label="Графический этюд: арка и длинная тень"><rect width="600" height="660" fill="#d8c7ad"/><rect y="470" width="600" height="190" fill="#aa9475"/><path d="M140 470V250a160 160 0 0 1 320 0v220Z" fill="#eee3d0"/><path d="M210 470V255a90 90 0 0 1 180 0v215Z" fill="#4e574a"/><path d="m140 470 320 0 140 190H300Z" fill="#7d8069"/><circle cx="492" cy="88" r="35" fill="#ebd5ad"/></svg><div class="caption">Арка в полдень<span>ФОРМА / 01</span></div></article>
+<article class="work"><svg viewBox="0 0 600 580" role="img" aria-label="Графический этюд: холмы и солнце"><rect width="600" height="580" fill="#c5d2cb"/><circle cx="430" cy="175" r="65" fill="#eddfba"/><path d="M0 345 180 170 350 380 490 280 600 410v170H0Z" fill="#7f9588"/><path d="M0 430 220 310 470 485 600 415v165H0Z" fill="#466454"/><path d="M0 535 200 450 380 580H0Z" fill="#b6bda0"/></svg><div class="caption">За линией холмов<span>ПЕЙЗАЖ / 02</span></div></article>
+<article class="work"><svg viewBox="0 0 600 460" role="img" aria-label="Графический этюд: лестница на терракотовом фоне"><rect width="600" height="460" fill="#b97356"/><path d="M0 390h120v-80h120v-80h120v-80h120V70h120v390H0Z" fill="#efc6a2"/><path d="M0 390h120l120 70H0m120-150h120l180 150H240m0-230h120l240 190v40H420m-60-310h120l120 90v160" fill="#875943"/></svg><div class="caption">Ритм ступеней<span>АРХИТЕКТУРА / 03</span></div></article>
+<article class="work"><svg viewBox="0 0 600 460" role="img" aria-label="Графический этюд: ваза у окна"><rect width="600" height="460" fill="#d8d3c4"/><rect x="330" y="40" width="210" height="270" fill="#f5eee0"/><path d="M435 40v270M330 175h210" stroke="#d8d3c4" stroke-width="14"/><rect y="350" width="600" height="110" fill="#a8ac99"/><ellipse cx="247" cy="376" rx="90" ry="20" fill="#858975"/><path d="M200 250h60l20 95q0 40-50 40t-50-40Z" fill="#a55b42"/><path d="M230 255q-30-100 30-175m-30 140q-80-50-65-100m67 46q60-70 95-52" fill="none" stroke="#58664c" stroke-width="9"/></svg><div class="caption">Утро у окна<span>СВЕТ / 04</span></div></article>
+</div></section><section class="about" id="about"><div class="eyebrow">О коллекции</div><div><p>Иногда достаточно двух цветов и одной линии, чтобы вспомнить место, в котором было хорошо.</p><p class="note">Эта коллекция посвящена простым вещам: свету на стене, медленному утру и пространству между предметами. Все работы — цифровые иллюстрации.</p></div></section></main><footer><span>Свет и форма · Графические этюды</span><a href="#works">Вернуться к работам ↑</a></footer></body></html>
+HTML
+      ;;
+    2)
+      cat > "$temporary" <<'HTML'
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="Тихие маршруты — заметки о неспешных прогулках и небольших путешествиях."><title>Тихие маршруты — журнал прогулок</title><style>
+*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:#fbf9f3;color:#283d35;font:16px/1.7 system-ui,sans-serif}a{color:inherit;text-decoration:none}.wrap{max-width:1120px;margin:auto;padding:0 32px}header{display:flex;align-items:center;justify-content:space-between;padding:30px 0;border-bottom:1px solid #d8ddd3}.brand{font:24px Georgia,serif}.brand span{margin-right:10px;color:#718668}nav{display:flex;gap:26px;font-size:13px}.hero{display:grid;grid-template-columns:1.1fr 1fr;gap:50px;padding:60px 0 48px;align-items:center}.label{font-size:11px;letter-spacing:.16em;color:#6d7e63;text-transform:uppercase}h1{font:clamp(38px,5vw,64px)/1.12 Georgia,serif;letter-spacing:-.03em;margin:20px 0}p{color:#65736a}.hero p{max-width:410px}.link{display:inline-block;border-bottom:1px solid #718668;padding-bottom:4px;font-size:13px;margin-top:15px}.map{background:#e9eee1;border-radius:130px 130px 12px 12px;overflow:hidden}.map svg{display:block;width:100%;height:auto}h2{font:32px Georgia,serif;margin:0}.heading{display:flex;justify-content:space-between;align-items:center;border-top:1px solid #d8ddd3;padding-top:32px;margin-bottom:24px}.heading span{font-size:12px;color:#83917f}.articles{display:grid;grid-template-columns:repeat(3,1fr);gap:24px}.article{padding:25px;background:#fff;border:1px solid #e0e5db;border-radius:8px}.number{font:38px Georgia;color:#bac5af}.article h3{font:23px/1.3 Georgia;margin:20px 0 12px}.article p{font-size:14px}.article details{border-top:1px solid #e4e9e0;padding-top:15px;font-size:13px}.article summary{cursor:pointer;color:#536b48}.article details p{font-size:13px}.packing{margin:48px 0;padding:32px 40px;background:#e9eee1;border-radius:8px;display:grid;grid-template-columns:1fr 1.5fr;gap:35px}.packing ul{margin:0;padding-left:20px;color:#526449;font-size:14px}.about{padding:15px 0 35px;max-width:700px}.about p{font-size:14px}footer{border-top:1px solid #d8ddd3;padding:25px 0;display:flex;justify-content:space-between;font-size:12px;color:#7a8674}a:hover{color:#8a6744}a:focus-visible,summary:focus-visible{outline:2px solid #718668;outline-offset:5px}@media(max-width:760px){.hero{grid-template-columns:1fr;gap:24px;padding-top:38px}.map{max-width:440px}.articles{grid-template-columns:1fr}.packing{grid-template-columns:1fr;padding:28px;gap:15px}.wrap{padding:0 22px}nav{gap:14px}.brand{font-size:20px}}@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+</style></head><body><div class="wrap"><header><a class="brand" href="#"><span>↟</span>Тихие маршруты</a><nav aria-label="Навигация"><a href="#notes">Заметки</a><a href="#packing">С собой</a></nav></header>
+<main><section class="hero"><div><div class="label">Небольшие путешествия · Большие впечатления</div><h1>Хороший день<br>начинается<br>с прогулки.</h1><p>Не обязательно уезжать далеко. Иногда новый маршрут начинается за поворотом знакомой улицы.</p><a class="link" href="#notes">Найти идею для выходного ↗</a></div><div class="map"><svg viewBox="0 0 480 440" role="img" aria-label="Иллюстрированная карта: лес, холмы и извилистая тропа"><rect width="480" height="440" fill="#e9eee1"/><path d="M0 200Q100 80 200 190T480 140V440H0Z" fill="#bcc9a6"/><path d="M0 300Q140 160 260 300T480 260V440H0Z" fill="#94ad85"/><path d="M0 385Q160 230 320 370T480 340V440H0Z" fill="#6e916b"/><path d="M220 440q-130-90 30-120t-50-100q-65-35 65-80" fill="none" stroke="#fbf9f3" stroke-width="25"/><path d="M220 440q-130-90 30-120t-50-100q-65-35 65-80" fill="none" stroke="#a99163" stroke-width="2" stroke-dasharray="5 8"/><g fill="#416948"><path d="m72 150-28 60h56Z"/><path d="m110 120-30 70h60Z"/><path d="m385 255-25 55h50Z"/><path d="m345 220-25 60h50Z"/></g><circle cx="265" cy="140" r="10" fill="#b27345"/><circle cx="265" cy="140" r="4" fill="#fbf9f3"/><circle cx="360" cy="72" r="29" fill="#eee1b0"/></svg></div></section>
+<section id="notes"><div class="heading"><h2>На ближайшие выходные</h2><span>3 идеи</span></div><div class="articles">
+<article class="article"><div class="number">01</div><div class="label">Город · 1–2 часа</div><h3>Незнакомая сторона знакомого города</h3><p>Выберите улицу, по которой обычно не ходите. Смотрите на окна, вывески и дворы — у города много тихих историй.</p><details><summary>Как спланировать прогулку</summary><p>Отметьте две точки на карте и соедините их небольшими улицами. Оставьте время на остановку и найдите обратный путь до начала прогулки.</p></details></article>
+<article class="article"><div class="number">02</div><div class="label">Природа · Полдня</div><h3>Тропинка вдоль воды</h3><p>Набережная, озеро или небольшой ручей. Вода задаёт спокойный ритм и помогает заметить смену сезона.</p><details><summary>На что обратить внимание</summary><p>Выбирайте открытые для прогулок дорожки. После дождя берег может быть скользким; удобная обувь и короткий запасной маршрут пригодятся.</p></details></article>
+<article class="article"><div class="number">03</div><div class="label">Рядом с домом · 40 минут</div><h3>Один парк, пять деталей</h3><p>Найдите необычное дерево, старую скамейку, красивую тень, новый звук и место, где хочется задержаться.</p><details><summary>Маленькое упражнение</summary><p>Сделайте по одной фотографии каждой детали. Дома выберите любимую и запишите пару слов о том, что привлекло внимание.</p></details></article>
+</div></section><section class="packing" id="packing"><div><div class="label">Простой список</div><h2>Легче рюкзак —<br>легче шаг.</h2></div><ul><li>Вода и небольшой перекус.</li><li>Удобная обувь и одежда по погоде.</li><li>Заряженный телефон и сохранённая карта.</li><li>Немного свободного времени без плотного расписания.</li></ul></section><section class="about"><h2>О журнале</h2><p>«Тихие маршруты» — коллекция идей для неспешных прогулок. Здесь нет гонки за расстояниями: главное — увидеть что-нибудь новое и вернуться с хорошим настроением.</p></section></main><footer><span>Тихие маршруты · Журнал прогулок</span><a href="#">К началу ↑</a></footer></div></body></html>
+HTML
+      ;;
+    3)
+      cat > "$temporary" <<'HTML'
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="На кухне — три простых рецепта из знакомых продуктов с понятными шагами приготовления."><title>На кухне — простые рецепты на каждый день</title><style>
+*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:#fffaf3;color:#352920;font:16px/1.7 system-ui,sans-serif}a{color:inherit;text-decoration:none}.wrap{max-width:1080px;margin:auto;padding:0 28px}header{display:flex;justify-content:space-between;align-items:center;padding:24px 0;border-bottom:1px solid #e5d9c9}.brand{font:28px Georgia,serif;color:#a6442c}nav{display:flex;gap:22px;font-size:13px}.hero{padding:50px 0;display:grid;grid-template-columns:1.2fr 1fr;gap:40px;align-items:center}.label{font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:#9a6b44}h1{font:clamp(40px,5.7vw,68px)/1.08 Georgia,serif;margin:20px 0;letter-spacing:-.04em}.hero p{color:#7e6d5e;max-width:420px}.dish{background:#eddfc5;border-radius:50%;padding:15px}.dish svg{display:block;width:100%;height:auto}.recipe-nav{display:flex;flex-wrap:wrap;gap:10px;margin:0 0 32px}.recipe-nav a{border:1px solid #dbcab4;border-radius:30px;padding:8px 18px;font-size:13px}.recipe-nav a:hover{background:#a6442c;color:white;border-color:#a6442c}.recipe{margin:0 0 26px;background:#fff;border:1px solid #e9ddce;border-radius:16px;overflow:hidden}.recipe-heading{display:flex;align-items:center;justify-content:space-between;padding:22px 30px;border-bottom:1px solid #eee5da;background:#fbf3e7;gap:20px}.recipe-heading h2{font:28px Georgia,serif;margin:0}.time{font-size:12px;white-space:nowrap;color:#946e48}.recipe-body{display:grid;grid-template-columns:1fr 1.7fr;gap:35px;padding:26px 30px}.recipe h3{font-size:11px;font-weight:600;letter-spacing:.15em;color:#9a6b44;text-transform:uppercase;margin:0 0 12px}.recipe ul,.recipe ol{padding-left:20px;margin:0;font-size:14px;color:#665344}.recipe li{margin-bottom:8px}.tip{padding:18px 30px;background:#f5f5e9;font-size:13px;color:#6a704e}.about{padding:28px 0 40px;max-width:700px}.about h2{font:30px Georgia,serif}.about p{color:#7e6d5e;font-size:14px}footer{display:flex;justify-content:space-between;gap:20px;border-top:1px solid #e5d9c9;padding:24px 0;color:#9a8672;font-size:12px}a:focus-visible{outline:2px solid #a6442c;outline-offset:4px}@media(max-width:650px){.hero{grid-template-columns:1fr;gap:20px;padding:32px 0}.dish{max-width:280px;margin:auto}.recipe-body{grid-template-columns:1fr;gap:24px;padding:24px}.recipe-heading{padding:22px;align-items:start}.recipe-heading h2{font-size:25px}.tip{padding:18px 24px}.wrap{padding:0 20px}nav{gap:14px}.brand{font-size:25px}}@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+</style></head><body><div class="wrap"><header><a class="brand" href="#">На кухне<span style="color:#cda465"> ✳</span></a><nav aria-label="Навигация"><a href="#recipes">Рецепты</a><a href="#about">О сборнике</a></nav></header><main><section class="hero"><div><div class="label">Знакомые продукты · Понятные шаги</div><h1>Домашняя еда.<br>Без лишней<br>суеты.</h1><p>Три простых рецепта для тех дней, когда хочется приготовить что-то хорошее из того, что уже есть дома.</p></div><div class="dish"><svg viewBox="0 0 400 400" role="img" aria-label="Иллюстрация тарелки с пастой, томатами и листьями базилика"><circle cx="200" cy="200" r="184" fill="#fffaf0"/><circle cx="200" cy="200" r="146" fill="#ece2ca"/><circle cx="200" cy="200" r="132" fill="#f5ecd8"/><g fill="none" stroke="#d9a64c" stroke-width="14" stroke-linecap="round"><path d="M130 130q140 10 130 55t-120 60 100 30"/><path d="M110 185q30-95 85-25t90 30-30 95"/><path d="M140 270q-45-85 35-65t90 60"/><path d="M175 120q-25 80 70 65t10 115"/></g><g fill="#bd563c"><circle cx="134" cy="176" r="23"/><circle cx="256" cy="252" r="25"/><circle cx="244" cy="140" r="21"/></g><g fill="#557443"><path d="M166 247q-50-65-75-13 25 34 75 13Z"/><path d="M254 190q40-60 62-13-15 30-62 13Z"/><path d="M185 150q-35-50-55-10 16 25 55 10Z"/></g></svg></div></section><div id="recipes" class="recipe-nav"><a href="#pasta">Паста с томатами</a><a href="#potatoes">Картофель в духовке</a><a href="#oats">Овсянка с яблоком</a></div>
+<article class="recipe" id="pasta"><div class="recipe-heading"><h2>Паста с томатами</h2><span class="time">25 минут · 2 порции</span></div><div class="recipe-body"><div><h3>Ингредиенты</h3><ul><li>200 г пасты</li><li>300 г томатов в собственном соку</li><li>2 зубчика чеснока</li><li>2 ст. л. оливкового масла</li><li>Соль, перец и базилик по вкусу</li></ul></div><div><h3>Приготовление</h3><ol><li>Вскипятите подсоленную воду. Варите пасту по инструкции на упаковке.</li><li>Нарежьте чеснок. Прогрейте его в масле на среднем огне около минуты, не давая подгореть.</li><li>Добавьте томаты, разомните крупные кусочки и готовьте 10–12 минут. Посолите и поперчите.</li><li>Смешайте соус с пастой. Если нужно, добавьте немного воды от варки. Подавайте с базиликом.</li></ol></div></div><div class="tip">Маленькая хитрость: сохраните полстакана воды от пасты — с ней соус лучше соединяется с макаронами.</div></article>
+<article class="recipe" id="potatoes"><div class="recipe-heading"><h2>Картофель с розмарином</h2><span class="time">45 минут · 2 порции</span></div><div class="recipe-body"><div><h3>Ингредиенты</h3><ul><li>500 г картофеля</li><li>2 ст. л. растительного масла</li><li>1 ч. л. сушёного розмарина</li><li>Соль и перец по вкусу</li></ul></div><div><h3>Приготовление</h3><ol><li>Разогрейте духовку до 200 °C. Вымойте картофель и нарежьте одинаковыми дольками.</li><li>Хорошо обсушите. Смешайте с маслом, розмарином, солью и перцем.</li><li>Разложите одним слоем на противне. Запекайте 30–40 минут, один раз перевернув, до мягкости внутри и золотистых краёв.</li></ol></div></div><div class="tip">Оставьте между дольками немного места: так они запекаются равномернее.</div></article>
+<article class="recipe" id="oats"><div class="recipe-heading"><h2>Овсянка с яблоком</h2><span class="time">15 минут · 1 порция</span></div><div class="recipe-body"><div><h3>Ингредиенты</h3><ul><li>50 г овсяных хлопьев</li><li>200 мл молока или воды</li><li>1 небольшое яблоко</li><li>Щепотка корицы</li><li>Мёд или сахар по желанию</li></ul></div><div><h3>Приготовление</h3><ol><li>В небольшой кастрюле доведите молоко или воду до слабого кипения.</li><li>Добавьте хлопья и готовьте по инструкции на упаковке, периодически помешивая.</li><li>Нарежьте яблоко мелкими кусочками. Добавьте в кашу за пару минут до готовности.</li><li>Снимите с огня, добавьте корицу и дайте постоять минуту под крышкой. Подсластите по вкусу.</li></ol></div></div><div class="tip">Более густую кашу легко разбавить ложкой тёплого молока уже в тарелке.</div></article>
+<section class="about" id="about"><h2>Меньше сложностей. Больше вкуса.</h2><p>Этот сборник — про обычную домашнюю кухню. Простые ингредиенты, небольшие порции и рецепты, которые легко подстроить под свой вкус. Начните с одного блюда и постепенно собирайте собственную коллекцию.</p></section></main><footer><span>На кухне · Рецепты на каждый день</span><a href="#">Наверх ↑</a></footer></div></body></html>
+HTML
+      ;;
+  esac
+  chmod 0644 "$temporary"
+  mv -f "$temporary" "$SELFSTEAL_DIR/html/index.html"
+  printf '%s\n' "$selection" > "$SELFSTEAL_DIR/.site-template"
+  ok "website template $selection written to $SELFSTEAL_DIR/html/index.html"
+}
+
+change_site() {
+  require_root
+  load_settings
+  exec 9>"$LOCK_FILE"
+  flock -n 9 || die "another installation or renewal is running"
+  local selection="${1:-$SELFSTEAL_TEMPLATE}"
+  # Keep a copy outside the public webroot before explicitly replacing a site.
+  if [[ -f "$SELFSTEAL_DIR/html/index.html" ]]; then
+    cp -a "$SELFSTEAL_DIR/html/index.html" "$SELFSTEAL_DIR/index.backup.$(date -u +%Y%m%dT%H%M%S).html"
+  fi
+  write_site_template "$selection"
+}
+
 write_nginx_files() {
   local tls="${1:-0}"
   mkdir -p "$SELFSTEAL_DIR/conf" "$SELFSTEAL_DIR/html/.well-known/acme-challenge" "$SELFSTEAL_DIR/ssl"
   if [[ ! -f "$SELFSTEAL_DIR/html/index.html" ]]; then
-    cat > "$SELFSTEAL_DIR/html/index.html" <<'HTML'
-<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Облако файлов</title>
-<style>body{font:18px system-ui;background:#f3f6fa;color:#243047;max-width:760px;margin:12vh auto;padding:24px}main{background:white;padding:40px;border-radius:20px}p{line-height:1.6}small{color:#68768b}</style>
-<main><small>FILE CLOUD</small><h1>Всё важное — в одном месте</h1><p>Пространство для хранения файлов, документов и идей.</p><p>Сервис готовится к запуску. Загляните к нам позже.</p></main></html>
-HTML
+    write_site_template "$SELFSTEAL_TEMPLATE"
   fi
   cat > "$SELFSTEAL_DIR/conf/default.conf" <<EOF
 server {
@@ -608,6 +682,7 @@ main() {
     renew) renew_certificate ;;
     deploy) deploy_certificate "${2:-}" ;;
     verify) verify_site ;;
+    change-site) change_site "${2:-$SELFSTEAL_TEMPLATE}" ;;
     status)
       require_root
       load_settings
@@ -616,7 +691,8 @@ main() {
       docker ps --filter "name=$SELFSTEAL_NGINX_SERVICE_NAME"
       ;;
     help|--help|-h)
-      echo "Usage: sudo NODE_IP=1.2.3.4 LE_EMAIL=you@example.com REMNANODE_SECRET_KEY=... bash $0 [install|renew|verify|status]"
+      echo "Usage: sudo NODE_IP=1.2.3.4 LE_EMAIL=you@example.com REMNANODE_SECRET_KEY=... bash $0 [install|renew|verify|status|change-site [1|2|3|random]]"
+      echo "SELFSTEAL_TEMPLATE: 1/portfolio, 2/travel, 3/recipes, random (default); install preserves an existing site."
       ;;
     *) die "unknown command: $1 (see --help)" ;;
   esac
